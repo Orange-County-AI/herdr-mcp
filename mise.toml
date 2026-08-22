@@ -1,0 +1,25 @@
+min_version = "2025.1.0"
+
+[tools]
+go = "1.25.3"
+
+[tasks.fmt]
+description = "Format Go sources"
+run = "gofmt -w cmd/herdr-mcp/*.go internal/*/*.go"
+
+[tasks.fmt-check]
+description = "Check Go formatting"
+run = "test -z \"$(gofmt -l cmd/herdr-mcp/*.go internal/*/*.go)\""
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks.build]
+description = "Build herdr-mcp"
+run = "go build -o herdr-mcp ./cmd/herdr-mcp"
+
+[tasks.check]
+description = "Run formatting, vet, and tests"
+depends = ["fmt-check"]
+run = "go vet ./... && go test ./..."

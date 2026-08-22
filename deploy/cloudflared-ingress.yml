@@ -1,0 +1,5 @@
+# Merge this rule before the final catch-all in the tunnel's config.
+ingress:
+  - hostname: herdr-mcp.example.com
+    service: http://127.0.0.1:8091
+  - service: http_status:404

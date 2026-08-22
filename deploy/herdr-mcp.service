@@ -1,0 +1,19 @@
+[Unit]
+Description=Herdr socket API MCP bridge
+After=network-online.target herdr.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/herdr-mcp/env
+ExecStart=%h/.local/bin/herdr-mcp serve --listen 127.0.0.1:8091
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

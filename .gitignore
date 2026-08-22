@@ -1,0 +1,4 @@
+/herdr-mcp
+/bin/
+.env
+*.log

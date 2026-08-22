@@ -1,0 +1,24 @@
+id = "ocai.herdr-mcp"
+name = "Herdr MCP"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Expose the active Herdr socket API as MCP tools"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["mkdir", "-p", "bin"]
+
+[[build]]
+command = ["go", "build", "-o", "bin/herdr-mcp", "./cmd/herdr-mcp"]
+
+[[actions]]
+id = "doctor"
+title = "Check Herdr MCP"
+contexts = ["global"]
+command = ["bin/herdr-mcp", "doctor"]
+
+[[panes]]
+id = "server"
+title = "Herdr MCP server"
+placement = "tab"
+command = ["bin/herdr-mcp", "serve"]
