@@ -205,7 +205,6 @@ EnvironmentFile=-%s
 ExecStart=%s serve --listen %s --herdr-bin %s
 Restart=on-failure
 RestartSec=3
-NoNewPrivileges=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
