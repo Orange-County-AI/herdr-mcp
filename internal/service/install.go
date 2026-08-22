@@ -210,6 +210,7 @@ ProtectHome=read-only
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
+WantedBy=default.target
 `, escapeEnvironmentFilePath(result.EnvPath), quote(result.BinaryPath), quote(listen), quote(herdrBinary))
 }
 

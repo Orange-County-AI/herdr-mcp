@@ -70,6 +70,7 @@ func TestInstallWritesAndStartsUserService(t *testing.T) {
 	}
 	for _, expected := range []string{
 		result.BinaryPath,
+		"WantedBy=default.target",
 		result.EnvPath,
 		"127.0.0.1:19091",
 		"/opt/herdr/bin/herdr",

@@ -22,7 +22,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const version = "0.2.3"
+const version = "0.2.4"
 
 type commonFlags struct {
 	socket       string
