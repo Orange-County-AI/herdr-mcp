@@ -18,10 +18,11 @@ import (
 	"github.com/Orange-County-AI/herdr-mcp/internal/access"
 	"github.com/Orange-County-AI/herdr-mcp/internal/herdr"
 	"github.com/Orange-County-AI/herdr-mcp/internal/mcpserver"
+	"github.com/Orange-County-AI/herdr-mcp/internal/service"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 type commonFlags struct {
 	socket       string
@@ -49,6 +50,8 @@ func run(arguments []string) error {
 		return runStdio(arguments[1:])
 	case "doctor":
 		return runDoctor(arguments[1:])
+	case "install-service":
+		return runInstallService(arguments[1:])
 	case "version", "--version", "-version":
 		fmt.Println(version)
 		return nil
@@ -179,6 +182,47 @@ func runDoctor(arguments []string) error {
 	})
 }
 
+func runInstallService(arguments []string) error {
+	flags := flag.NewFlagSet("install-service", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	listen := flags.String("listen", envDefault("HERDR_MCP_LISTEN", "127.0.0.1:8091"), "loopback address for the installed service")
+	timeout := flags.Duration("timeout", 15*time.Second, "maximum time to wait for service health")
+	if err := flags.Parse(arguments); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("install-service does not accept positional arguments")
+	}
+	if err := validateListen(*listen); err != nil {
+		return err
+	}
+	if *timeout <= 0 {
+		return fmt.Errorf("--timeout must be greater than zero")
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	installer, err := service.NewInstaller()
+	if err != nil {
+		return err
+	}
+	result, err := installer.Install(ctx, service.Options{
+		Listen:        *listen,
+		HealthTimeout: *timeout,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Installed %s\n", result.BinaryPath)
+	fmt.Printf("Enabled %s\n", result.UnitPath)
+	fmt.Printf("Healthy %s\n", result.HealthURL)
+	fmt.Printf("Optional environment: %s\n", result.EnvPath)
+	return nil
+}
+
 func addCommonFlags(flags *flag.FlagSet) *commonFlags {
 	defaultSocket, err := herdr.DefaultSocketPath()
 	if err != nil {
@@ -271,9 +315,10 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, `herdr-mcp exposes Herdr's socket API as MCP tools.
 
 usage:
-  herdr-mcp serve [flags]   serve Streamable HTTP on loopback (default)
-  herdr-mcp stdio [flags]   serve MCP over stdin/stdout
-  herdr-mcp doctor [flags]  verify schema/socket compatibility
+  herdr-mcp serve [flags]            serve Streamable HTTP on loopback (default)
+  herdr-mcp stdio [flags]            serve MCP over stdin/stdout
+  herdr-mcp doctor [flags]           verify schema/socket compatibility
+  herdr-mcp install-service [flags]  install and start a systemd user service
   herdr-mcp version
 
 Run "herdr-mcp <command> -h" for command flags.`)

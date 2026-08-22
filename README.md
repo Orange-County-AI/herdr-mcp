@@ -25,6 +25,19 @@ Verify the binary and socket agree:
 herdr-mcp doctor
 ```
 
+## Agent skill
+
+Install the repository's root skill globally for supported coding agents:
+
+```sh
+npx skills add Orange-County-AI/herdr-mcp --skill herdr-mcp -g
+```
+
+Omit `-g` to install it only in the current project. The skill teaches agents
+how to select stdio or HTTP, install the user service, configure method policy,
+set up Cloudflare Tunnel and Access Managed OAuth, and diagnose socket,
+protocol, health, and Access assertion failures.
+
 ## Local MCP
 
 For a local client, use stdio:
@@ -64,14 +77,23 @@ This split is deliberate. Claude and ChatGPT need interactive OAuth, and current
 
 ### 1. Run the loopback origin
 
+On Linux with systemd, one command copies the current binary to
+`~/.local/bin`, writes and enables the user unit, restarts it, and waits for the
+health endpoint:
+
 ```sh
-go build -o ~/.local/bin/herdr-mcp ./cmd/herdr-mcp
-mkdir -p ~/.config/systemd/user
-cp deploy/herdr-mcp.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now herdr-mcp
-curl --fail http://127.0.0.1:8091/healthz
+herdr-mcp install-service
 ```
+
+The command resolves the absolute Herdr binary before writing the unit, so the
+service does not depend on an interactive shell's `PATH`. It is idempotent and
+can also update an existing installation. To select another loopback port:
+
+```sh
+herdr-mcp install-service --listen 127.0.0.1:18091
+```
+
+`deploy/herdr-mcp.service` remains available as a manual template.
 
 If the service does not inherit the correct session socket, add it to `~/.config/herdr-mcp/env`:
 
@@ -145,9 +167,10 @@ An allow list is evaluated first; the deny list always wins.
 ## Commands
 
 ```text
-herdr-mcp serve [flags]   Streamable HTTP at /mcp plus GET /healthz
-herdr-mcp stdio [flags]   MCP over stdin/stdout
-herdr-mcp doctor [flags]  schema/socket compatibility check
+herdr-mcp serve [flags]            Streamable HTTP at /mcp plus GET /healthz
+herdr-mcp stdio [flags]            MCP over stdin/stdout
+herdr-mcp doctor [flags]           schema/socket compatibility check
+herdr-mcp install-service [flags]  install and start a systemd user service
 herdr-mcp version
 ```
 
@@ -172,7 +195,7 @@ mise run check
 mise run build
 ```
 
-The bridge has no generated copy of Herdr's API types. Tests cover schema extraction and reference closure, socket request/response behavior, MCP tool forwarding, and Cloudflare Access JWT validation.
+The bridge has no generated copy of Herdr's API types. Tests cover schema extraction and reference closure, socket request/response behavior, MCP tool forwarding, systemd service installation, and Cloudflare Access JWT validation.
 
 ## License
 
