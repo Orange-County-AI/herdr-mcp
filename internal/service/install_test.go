@@ -103,6 +103,27 @@ func TestInstallRejectsUnsupportedPlatform(t *testing.T) {
 	}
 }
 
+func TestResolveListenPrefersExplicitThenExistingServiceEnvironment(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), "herdr-mcp", "env")
+	if err := os.MkdirAll(filepath.Dir(envPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(envPath, []byte("# existing service configuration\nHERDR_MCP_LISTEN=127.0.0.1:18091\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	listen, err := resolveListen("", envPath)
+	if err != nil || listen != "127.0.0.1:18091" {
+		t.Fatalf("existing service listen = %q, err = %v", listen, err)
+	}
+	listen, err = resolveListen("127.0.0.1:19091", envPath)
+	if err != nil || listen != "127.0.0.1:19091" {
+		t.Fatalf("explicit listen = %q, err = %v", listen, err)
+	}
+	if _, err := resolveListen("0.0.0.0:8091", envPath); err == nil {
+		t.Fatal("non-loopback listen was accepted")
+	}
+}
+
 func TestUnitBodyEscapesSystemdPaths(t *testing.T) {
 	body := unitBody(Result{
 		BinaryPath: "/home/test user/.local/bin/herdr-mcp",

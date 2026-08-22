@@ -22,7 +22,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const version = "0.2.4"
+const version = "0.2.5"
 
 type commonFlags struct {
 	socket       string
@@ -185,7 +185,7 @@ func runDoctor(arguments []string) error {
 func runInstallService(arguments []string) error {
 	flags := flag.NewFlagSet("install-service", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	listen := flags.String("listen", envDefault("HERDR_MCP_LISTEN", "127.0.0.1:8091"), "loopback address for the installed service")
+	listen := flags.String("listen", os.Getenv("HERDR_MCP_LISTEN"), "loopback address for the installed service (default: existing service environment or 127.0.0.1:8091)")
 	timeout := flags.Duration("timeout", 15*time.Second, "maximum time to wait for service health")
 	if err := flags.Parse(arguments); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -195,9 +195,6 @@ func runInstallService(arguments []string) error {
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("install-service does not accept positional arguments")
-	}
-	if err := validateListen(*listen); err != nil {
-		return err
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("--timeout must be greater than zero")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -88,9 +89,12 @@ func (installer *Installer) Install(ctx context.Context, options Options) (Resul
 	if installer.GOOS != "linux" {
 		return Result{}, fmt.Errorf("install-service requires Linux with systemd user services")
 	}
-	if options.Listen == "" {
-		options.Listen = "127.0.0.1:8091"
+	envPath := filepath.Join(installer.ConfigDir, "herdr-mcp", "env")
+	listen, err := resolveListen(options.Listen, envPath)
+	if err != nil {
+		return Result{}, err
 	}
+	options.Listen = listen
 	if options.HealthTimeout <= 0 {
 		options.HealthTimeout = 15 * time.Second
 	}
@@ -101,7 +105,7 @@ func (installer *Installer) Install(ctx context.Context, options Options) (Resul
 	result := Result{
 		BinaryPath: filepath.Join(installer.HomeDir, ".local", "bin", "herdr-mcp"),
 		UnitPath:   filepath.Join(installer.ConfigDir, "systemd", "user", UnitName),
-		EnvPath:    filepath.Join(installer.ConfigDir, "herdr-mcp", "env"),
+		EnvPath:    envPath,
 		HealthURL:  "http://" + options.Listen + "/healthz",
 	}
 	if err := installExecutable(installer.Executable, result.BinaryPath); err != nil {
@@ -127,6 +131,55 @@ func (installer *Installer) Install(ctx context.Context, options Options) (Resul
 		return Result{}, fmt.Errorf("service did not become healthy: %w; inspect with `systemctl --user status %s`", err, UnitName)
 	}
 	return result, nil
+}
+
+func resolveListen(explicit, envPath string) (string, error) {
+	listen := strings.TrimSpace(explicit)
+	if listen == "" {
+		value, err := environmentValue(envPath, "HERDR_MCP_LISTEN")
+		if err != nil {
+			return "", err
+		}
+		listen = value
+	}
+	if listen == "" {
+		listen = "127.0.0.1:8091"
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", fmt.Errorf("invalid loopback listen address %q: %w", listen, err)
+	}
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return "", fmt.Errorf("listen address %q is not loopback", listen)
+		}
+	}
+	return listen, nil
+}
+
+func environmentValue(path, key string) (string, error) {
+	content, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read service environment %s: %w", path, err)
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+		name, value, found := strings.Cut(line, "=")
+		if found && strings.TrimSpace(name) == key {
+			return strings.Trim(strings.TrimSpace(value), `"`), nil
+		}
+	}
+	return "", nil
 }
 
 func installExecutable(source, destination string) error {

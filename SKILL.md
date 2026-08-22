@@ -76,7 +76,15 @@ herdr-mcp install-service
 Both copy the selected executable to `~/.local/bin/herdr-mcp`, resolve the
 absolute Herdr binary, write `~/.config/systemd/user/herdr-mcp.service`, reload
 systemd, enable and restart the unit, and wait for the health endpoint. The
-standalone command accepts custom flags such as:
+installer uses explicit `--listen` first, then `HERDR_MCP_LISTEN` from the
+existing `~/.config/herdr-mcp/env`, then `127.0.0.1:8091`. Set the environment
+value before invoking the plugin action if the default port is occupied:
+
+```dotenv
+HERDR_MCP_LISTEN=127.0.0.1:18091
+```
+
+The standalone command also accepts custom flags:
 
 ```bash
 herdr-mcp install-service --listen 127.0.0.1:18091

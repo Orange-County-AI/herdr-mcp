@@ -104,9 +104,15 @@ herdr-mcp install-service
 ```
 
 Both forms resolve the absolute Herdr binary before writing the unit, are
-idempotent, and can update an existing installation. The standalone command
-also accepts `--listen 127.0.0.1:18091`. The plugin action uses the default
-`127.0.0.1:8091`; use the standalone command for custom service flags.
+idempotent, and can update an existing installation. `install-service` first
+honors an explicit `--listen`, then `HERDR_MCP_LISTEN` in the existing service
+environment file, and finally defaults to `127.0.0.1:8091`. Configure a
+non-default port before invoking the plugin action:
+
+```dotenv
+# ~/.config/herdr-mcp/env
+HERDR_MCP_LISTEN=127.0.0.1:18091
+```
 
 `deploy/herdr-mcp.service` remains available as a manual template.
 
