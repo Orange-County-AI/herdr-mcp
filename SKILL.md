@@ -7,26 +7,35 @@ description: "Install, configure, run, expose, and troubleshoot herdr-mcp, the M
 
 `herdr-mcp` turns the active Herdr session's local socket methods into MCP tools. It supports stdio for local clients and Streamable HTTP for remote clients.
 
-## Establish the installed state
+## Install through Herdr by default
 
-Check the binaries and live socket before changing configuration:
+Prefer Herdr's plugin manager. It owns an isolated checkout and build, avoiding
+collisions with a different `herdr-mcp` already installed through `GOBIN`:
 
 ```bash
-command -v herdr
-command -v herdr-mcp
-herdr-mcp version
-herdr-mcp doctor
+herdr plugin install Orange-County-AI/herdr-mcp --yes
+herdr plugin action invoke ocai.herdr-mcp.doctor
 ```
 
-`doctor` is the authority for compatibility. It loads `herdr api schema --json`, pings the selected socket, and refuses a protocol mismatch.
+On Linux, install or update the always-on service from the managed plugin:
 
-If `herdr-mcp` is missing and Go is available:
+```bash
+herdr plugin action invoke ocai.herdr-mcp.install-service
+```
+
+Do not mix plugin and standalone installation unless the user deliberately
+chooses which binary owns the service and which appears first on `PATH`.
+
+Use standalone Go installation only when the plugin is unsuitable or a local
+stdio client needs a directly addressable executable:
 
 ```bash
 go install github.com/Orange-County-AI/herdr-mcp/cmd/herdr-mcp@latest
+herdr-mcp doctor
 ```
 
-Herdr must be running. `HERDR_SOCKET_PATH` selects a non-default or named session socket. `HERDR_BIN` selects the Herdr binary whose schema should be exposed.
+Herdr must be running. `HERDR_SOCKET_PATH` selects a non-default session socket.
+`HERDR_BIN` selects the Herdr binary whose schema should be exposed.
 
 ## Choose the transport
 
@@ -52,15 +61,22 @@ Never bind the origin to a public interface. The CLI refuses non-loopback listen
 
 ## Install the Linux user service
 
-On Linux with systemd, prefer the idempotent installer over manually copying the binary and unit:
+With the recommended plugin installation:
+
+```bash
+herdr plugin action invoke ocai.herdr-mcp.install-service
+```
+
+With a standalone binary:
 
 ```bash
 herdr-mcp install-service
 ```
 
-It copies the current executable to `~/.local/bin/herdr-mcp`, resolves the absolute Herdr binary, writes `~/.config/systemd/user/herdr-mcp.service`, reloads systemd, enables and restarts the unit, and waits for `http://127.0.0.1:8091/healthz`.
-
-Use a different loopback port when required:
+Both copy the selected executable to `~/.local/bin/herdr-mcp`, resolve the
+absolute Herdr binary, write `~/.config/systemd/user/herdr-mcp.service`, reload
+systemd, enable and restart the unit, and wait for the health endpoint. The
+standalone command accepts custom flags such as:
 
 ```bash
 herdr-mcp install-service --listen 127.0.0.1:18091

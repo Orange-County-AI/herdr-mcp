@@ -11,19 +11,46 @@ At startup it:
 
 The tool surface follows the socket method names: `agent.read` becomes `agent_read`, `pane.wait_for_output` becomes `pane_wait_for_output`, and so on. Results are returned as both MCP structured content and JSON text.
 
-## Install
+## Herdr plugin
+
+**Recommended.** Let Herdr own the checkout and build instead of placing a
+second copy in `GOBIN`:
+
+```sh
+herdr plugin install Orange-County-AI/herdr-mcp --yes
+herdr plugin action invoke ocai.herdr-mcp.doctor
+```
+
+On Linux, install or update the always-on user service from that managed
+plugin binary:
+
+```sh
+herdr plugin action invoke ocai.herdr-mcp.install-service
+```
+
+This avoids collisions with a pre-existing `go install` binary and keeps the
+plugin build isolated under Herdr's managed checkout. Do not mix the plugin and
+standalone installation methods unless you intentionally manage which binary
+is first on `PATH`.
+
+For an interactive HTTP server in a Herdr-managed tab instead of systemd:
+
+```sh
+herdr plugin pane open --plugin ocai.herdr-mcp --entrypoint server
+```
+
+## Standalone Go binary
+
+Use this only when you are not installing the Herdr plugin, or when you need a
+standalone stdio binary:
 
 ```sh
 go install github.com/Orange-County-AI/herdr-mcp/cmd/herdr-mcp@latest
-```
-
-Herdr must be running. `herdr-mcp` uses `HERDR_SOCKET_PATH` when set and otherwise targets the default session at the platform's Herdr config directory.
-
-Verify the binary and socket agree:
-
-```sh
 herdr-mcp doctor
 ```
+
+Herdr must be running. `herdr-mcp` uses `HERDR_SOCKET_PATH` when set and
+otherwise targets the default session at the platform's Herdr config directory.
 
 ## Agent skill
 
@@ -52,22 +79,6 @@ For example, Claude Code can launch it directly:
 claude mcp add --transport stdio --scope user herdr -- herdr-mcp stdio
 ```
 
-## Herdr plugin
-
-The repository is also a Herdr plugin. Installation builds the Go binary in the managed plugin checkout:
-
-```sh
-herdr plugin install Orange-County-AI/herdr-mcp --yes
-herdr plugin action invoke ocai.herdr-mcp.doctor
-```
-
-For an interactive/local HTTP server in a Herdr-managed tab:
-
-```sh
-herdr plugin pane open --plugin ocai.herdr-mcp --entrypoint server
-```
-
-That pane is not a process supervisor. Use systemd for an always-on Cloudflare Tunnel origin.
 
 ## Remote MCP through Cloudflare Tunnel
 
@@ -77,21 +88,25 @@ This split is deliberate. Claude and ChatGPT need interactive OAuth, and current
 
 ### 1. Run the loopback origin
 
-On Linux with systemd, one command copies the current binary to
-`~/.local/bin`, writes and enables the user unit, restarts it, and waits for the
-health endpoint:
+The recommended plugin flow installs the Linux systemd user service with:
+
+```sh
+herdr plugin action invoke ocai.herdr-mcp.install-service
+```
+
+The action copies the managed plugin binary to `~/.local/bin`, writes and
+enables the user unit, restarts it, and waits for the health endpoint.
+
+With the standalone Go installation, run the equivalent CLI command:
 
 ```sh
 herdr-mcp install-service
 ```
 
-The command resolves the absolute Herdr binary before writing the unit, so the
-service does not depend on an interactive shell's `PATH`. It is idempotent and
-can also update an existing installation. To select another loopback port:
-
-```sh
-herdr-mcp install-service --listen 127.0.0.1:18091
-```
+Both forms resolve the absolute Herdr binary before writing the unit, are
+idempotent, and can update an existing installation. The standalone command
+also accepts `--listen 127.0.0.1:18091`. The plugin action uses the default
+`127.0.0.1:8091`; use the standalone command for custom service flags.
 
 `deploy/herdr-mcp.service` remains available as a manual template.
 
