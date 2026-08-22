@@ -205,7 +205,6 @@ EnvironmentFile=-%s
 ExecStart=%s serve --listen %s --herdr-bin %s
 Restart=on-failure
 RestartSec=3
-PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
