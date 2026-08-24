@@ -22,7 +22,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const version = "0.2.5"
+const version = "0.2.6"
+
+const defaultDenyMethods = "events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*"
 
 type commonFlags struct {
 	socket       string
@@ -228,8 +230,7 @@ func addCommonFlags(flags *flag.FlagSet) *commonFlags {
 	common := &commonFlags{}
 	flags.StringVar(&common.socket, "socket", defaultSocket, "Herdr API socket path")
 	flags.StringVar(&common.herdrBinary, "herdr-bin", envDefault("HERDR_BIN", "herdr"), "Herdr binary used to load the API schema")
-	flags.StringVar(&common.allowMethods, "allow-methods", os.Getenv("HERDR_MCP_ALLOW_METHODS"), "comma-separated method globs to expose (default: all)")
-	flags.StringVar(&common.denyMethods, "deny-methods", envDefault("HERDR_MCP_DENY_METHODS", "events.subscribe"), "comma-separated method globs to omit")
+	flags.StringVar(&common.denyMethods, "deny-methods", envDefault("HERDR_MCP_DENY_METHODS", defaultDenyMethods), "comma-separated method globs to omit")
 	return common
 }
 

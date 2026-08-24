@@ -166,8 +166,9 @@ Claude can add it as a remote HTTP MCP server. In ChatGPT, add the URL as a cust
 
 ## Method policy
 
-By default every non-streaming method in the selected Herdr schema is exposed except `events.subscribe`. A one-shot MCP tool call cannot preserve that subscription's streaming socket lifetime; use `events_wait` or `pane_wait_for_output` instead.
+By default every non-streaming client-facing method in the selected Herdr schema is exposed. `events.subscribe` is omitted because a one-shot MCP tool call cannot preserve that streaming socket lifetime; use `events_wait` or `pane_wait_for_output` instead. Harness-internal lifecycle reporting (`pane.report_*`, `pane.release_agent`, and `pane.clear_agent_authority`) and terminal graphics (`pane.graphics.*`) are also omitted to keep client tool discovery focused on agent and pane control.
 
+To re-expose the internal methods for a specialized client while keeping the unsupported subscription excluded, pass `--deny-methods 'events.subscribe'`.
 The full surface includes destructive operations such as `server_stop`, `worktree_remove`, `pane_close`, plugin unlinking, and integration uninstalling. Restrict a deployment with exact names or shell-style globs:
 
 ```sh
@@ -180,8 +181,7 @@ Equivalent environment variables:
 
 ```dotenv
 HERDR_MCP_ALLOW_METHODS=ping,session.snapshot,agent.*,pane.read,pane.wait_for_output
-HERDR_MCP_DENY_METHODS=events.subscribe,server.stop,server.live_handoff
-```
+HERDR_MCP_DENY_METHODS=events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*
 
 An allow list is evaluated first; the deny list always wins.
 
@@ -202,7 +202,7 @@ Common configuration:
 | `--socket` | `HERDR_SOCKET_PATH` | default Herdr session socket |
 | `--herdr-bin` | `HERDR_BIN` | `herdr` |
 | `--allow-methods` | `HERDR_MCP_ALLOW_METHODS` | all methods |
-| `--deny-methods` | `HERDR_MCP_DENY_METHODS` | `events.subscribe` |
+| `--deny-methods` | `HERDR_MCP_DENY_METHODS` | internal reporting, graphics, and `events.subscribe` |
 | `--listen` | `HERDR_MCP_LISTEN` | `127.0.0.1:8091` |
 | `--access-team-domain` | `CF_ACCESS_TEAM_DOMAIN` | unset |
 | `--access-aud` | `CF_ACCESS_AUD` | unset |

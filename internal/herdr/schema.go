@@ -103,8 +103,10 @@ func (s *Schema) Methods(allow, deny []string) ([]MethodDefinition, error) {
 		}
 
 		closure := make(map[string]any)
-		if err := collectDefinitions(rootName, request.Defs, closure); err != nil {
-			return nil, fmt.Errorf("method %q input schema: %w", method, err)
+		for _, reference := range requestReferences(input) {
+			if err := collectDefinitions(strings.TrimPrefix(reference, requestDefinitionPrefix), request.Defs, closure); err != nil {
+				return nil, fmt.Errorf("method %q input schema: %w", method, err)
+			}
 		}
 		standaloneDefs := make(map[string]any, len(closure))
 		for name, definition := range closure {
@@ -116,6 +118,8 @@ func (s *Schema) Methods(allow, deny []string) ([]MethodDefinition, error) {
 			standaloneDefs[name] = copy
 		}
 		rewriteRequestRefs(input)
+		inlineEnumReferences(input, standaloneDefs)
+		standaloneDefs = referencedDefinitions(input, standaloneDefs)
 		if len(standaloneDefs) > 0 {
 			input["$defs"] = standaloneDefs
 		}
@@ -214,6 +218,67 @@ func rewriteRequestRefs(value any) {
 			rewriteRequestRefs(child)
 		}
 	}
+}
+
+// inlineEnumReferences replaces standalone enum definitions with the enum at
+// its use site. This keeps client-facing schemas compact while preserving every
+// permitted value at the parameter that needs it.
+func inlineEnumReferences(value any, definitions map[string]any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if reference, ok := typed["$ref"].(string); ok && len(typed) == 1 && strings.HasPrefix(reference, "#/$defs/") {
+			name := strings.TrimPrefix(reference, "#/$defs/")
+			if definition, ok := definitions[name].(map[string]any); ok && definition["enum"] != nil {
+				for key := range typed {
+					delete(typed, key)
+				}
+				for key, child := range definition {
+					typed[key] = child
+				}
+				return
+			}
+		}
+		for _, child := range typed {
+			inlineEnumReferences(child, definitions)
+		}
+	case []any:
+		for _, child := range typed {
+			inlineEnumReferences(child, definitions)
+		}
+	}
+}
+
+// referencedDefinitions retains only definitions reachable from the input
+// schema after leaf enums have been inlined.
+func referencedDefinitions(input map[string]any, definitions map[string]any) map[string]any {
+	used := make(map[string]struct{})
+	var addReferences func(any)
+	addReferences = func(value any) {
+		switch typed := value.(type) {
+		case map[string]any:
+			if reference, ok := typed["$ref"].(string); ok && strings.HasPrefix(reference, "#/$defs/") {
+				name := strings.TrimPrefix(reference, "#/$defs/")
+				if _, seen := used[name]; !seen {
+					used[name] = struct{}{}
+					addReferences(definitions[name])
+				}
+			}
+			for _, child := range typed {
+				addReferences(child)
+			}
+		case []any:
+			for _, child := range typed {
+				addReferences(child)
+			}
+		}
+	}
+	addReferences(input)
+
+	retained := make(map[string]any, len(used))
+	for name := range used {
+		retained[name] = definitions[name]
+	}
+	return retained
 }
 
 func cloneObject(value any) (map[string]any, error) {

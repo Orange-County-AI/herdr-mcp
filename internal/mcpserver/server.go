@@ -13,10 +13,14 @@ import (
 
 const instructions = `This server exposes the active Herdr terminal session's socket API.
 Each MCP tool maps directly to one Herdr method: underscores in the tool name correspond to dots in the socket method name (agent_read calls agent.read).
+
+Common agent workflow: worktree_create or workspace_create creates a root_pane.pane_id; pane_split creates another pane_id; agent_start requires that existing pane_id and does not create panes. agent_start waits for interactive readiness when possible. Then call agent_prompt with target (agent name or pane_id) and text; use agent_wait to wait for status and agent_read with source=recent_unwrapped to read output.
+
+Read source values are visible (rendered viewport), recent (scrollback with soft wraps), recent_unwrapped (scrollback with wraps joined; best for logs), and detection (agent detector buffer).
 Use session_snapshot or the list methods to discover stable workspace, tab, pane, and agent identifiers before mutating state.
 Prefer agent_prompt, agent_wait, and agent_read for agent conversations. pane_send_text and pane_send_keys are lower-level terminal input and can interleave with an agent's active turn.
 Close, remove, unlink, uninstall, release, and server-stop methods are destructive. Only call them when the user explicitly intends that state change.
-events_subscribe is omitted because its streaming socket lifetime cannot be represented by one MCP tool call; use events_wait or pane_wait_for_output instead.`
+events_subscribe and harness-internal lifecycle reporting are intentionally omitted from this client-facing tool surface.`
 
 // Server wraps a dynamically registered MCP server and its source schema.
 type Server struct {
@@ -51,11 +55,11 @@ func New(schema *herdr.Schema, client *herdr.Client, version string, allow, deny
 		mcpServer.AddTool(&mcp.Tool{
 			Name:        definition.ToolName,
 			Title:       toolTitle(definition.Method),
-			Description: fmt.Sprintf("Invoke Herdr socket method %q. The input schema comes from the selected Herdr binary (protocol %d, schema %d).", definition.Method, schema.Protocol, schema.SchemaVersion),
+			Description: toolDescription(definition.Method, definition.InputSchema),
 			InputSchema: definition.InputSchema,
 			Annotations: annotations(definition.Method),
 		}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			return server.call(ctx, definition.Method, request.Params.Arguments), nil
+			return server.call(ctx, definition.Method, definition.InputSchema, request.Params.Arguments), nil
 		})
 	}
 	return server, nil
@@ -70,33 +74,60 @@ func (s *Server) HTTPHandler() http.Handler {
 	})
 }
 
-func (s *Server) call(ctx context.Context, method string, arguments json.RawMessage) *mcp.CallToolResult {
-	result, err := s.Client.Call(ctx, method, arguments)
+func (s *Server) call(ctx context.Context, method string, input map[string]any, arguments json.RawMessage) *mcp.CallToolResult {
+	normalized, notes, err := normalizeArguments(method, input, arguments)
 	if err != nil {
-		payload, _ := json.Marshal(map[string]any{
-			"method": method,
-			"error":  err.Error(),
-		})
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(payload)}},
-			IsError: true,
+		return errorResult(method, err)
+	}
+	if method == "agent.wait" {
+		if err := s.waitThroughLaunch(ctx, normalized); err != nil {
+			return errorResult(method, err, notes...)
+		}
+	}
+	result, err := s.Client.Call(ctx, method, normalized)
+	if err != nil {
+		if strings.HasPrefix(method, "agent.") {
+			err = s.enrichAgentError(ctx, method, normalized, err)
+		}
+		return errorResult(method, err, notes...)
+	}
+	if method == "agent.start" {
+		var readinessNote string
+		result, readinessNote, err = s.waitForStartedAgent(ctx, result, normalized)
+		if err != nil {
+			return errorResult(method, err, notes...)
+		}
+		if readinessNote != "" {
+			notes = append(notes, readinessNote)
 		}
 	}
 
 	var structured map[string]any
 	if err := json.Unmarshal(result, &structured); err != nil {
-		payload, _ := json.Marshal(map[string]any{
-			"method": method,
-			"error":  "Herdr returned a non-object result: " + err.Error(),
-		})
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(payload)}},
-			IsError: true,
-		}
+		return errorResult(method, fmt.Errorf("Herdr returned a non-object result: %w", err))
+	}
+	content := []mcp.Content{&mcp.TextContent{Text: string(result)}}
+	for _, note := range notes {
+		content = append(content, &mcp.TextContent{Text: note})
 	}
 	return &mcp.CallToolResult{
-		Content:           []mcp.Content{&mcp.TextContent{Text: string(result)}},
+		Content:           content,
 		StructuredContent: structured,
+	}
+}
+
+func errorResult(method string, err error, notes ...string) *mcp.CallToolResult {
+	payload, _ := json.Marshal(map[string]any{
+		"method": method,
+		"error":  err.Error(),
+	})
+	content := []mcp.Content{&mcp.TextContent{Text: string(payload)}}
+	for _, note := range notes {
+		content = append(content, &mcp.TextContent{Text: note})
+	}
+	return &mcp.CallToolResult{
+		Content: content,
+		IsError: true,
 	}
 }
 

@@ -65,20 +65,16 @@ func TestMethodsBuildStandaloneSchemas(t *testing.T) {
 	if methods[1].Method != "pane.read" || methods[1].ToolName != "pane_read" {
 		t.Fatalf("method = %+v", methods[1])
 	}
-	defs, ok := methods[1].InputSchema["$defs"].(map[string]any)
-	if !ok {
-		t.Fatalf("$defs = %#v", methods[1].InputSchema["$defs"])
-	}
-	if defs["PaneReadParams"] == nil || defs["ReadSource"] == nil {
-		t.Fatalf("transitive definitions missing: %v", defs)
-	}
-	if defs["Unused"] != nil || defs["EmptyParams"] != nil {
-		t.Fatalf("unrelated definitions leaked into schema: %v", defs)
+	if _, ok := methods[1].InputSchema["$defs"]; ok {
+		t.Fatalf("unneeded $defs were retained: %v", methods[1].InputSchema["$defs"])
 	}
 	properties := methods[1].InputSchema["properties"].(map[string]any)
 	source := properties["source"].(map[string]any)
-	if source["$ref"] != "#/$defs/ReadSource" {
-		t.Fatalf("source ref = %v", source["$ref"])
+	if source["enum"] == nil {
+		t.Fatalf("source enum was not inlined: %v", source)
+	}
+	if source["$ref"] != nil {
+		t.Fatalf("source ref was retained: %v", source["$ref"])
 	}
 
 	encoded, err := json.Marshal(methods[1].InputSchema)
