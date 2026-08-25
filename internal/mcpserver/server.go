@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Orange-County-AI/herdr-mcp/internal/herdr"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -22,6 +24,13 @@ Prefer agent_prompt, agent_wait, and agent_read for agent conversations. pane_se
 Close, remove, unlink, uninstall, release, and server-stop methods are destructive. Only call them when the user explicitly intends that state change.
 events_subscribe and harness-internal lifecycle reporting are intentionally omitted from this client-facing tool surface.`
 
+// defaultSlowCallThreshold is the point past which a *successful* call still
+// earns a log line. This server writes no response bytes until the tool
+// returns, so a call that runs this long is one an HTTP intermediary may
+// already have given up on -- the client sees a dead request while the server
+// sees a success, and only the log connects the two.
+const defaultSlowCallThreshold = 60 * time.Second
+
 // Server wraps a dynamically registered MCP server and its source schema.
 type Server struct {
 	MCP     *mcp.Server
@@ -29,6 +38,13 @@ type Server struct {
 	Methods []herdr.MethodDefinition
 	Client  *herdr.Client
 	Version string
+	// Logf receives one line per failed or slow tool call. Tool failures travel
+	// to the client inside the result content, and some clients render an
+	// errored result without that content at all, so this log is the only place
+	// an operator can find out what actually broke.
+	Logf func(format string, args ...any)
+	// SlowCallThreshold overrides defaultSlowCallThreshold.
+	SlowCallThreshold time.Duration
 }
 
 // New registers one MCP tool for every selected method in the Herdr request schema.
@@ -75,6 +91,42 @@ func (s *Server) HTTPHandler() http.Handler {
 }
 
 func (s *Server) call(ctx context.Context, method string, input map[string]any, arguments json.RawMessage) *mcp.CallToolResult {
+	started := time.Now()
+	result := s.dispatch(ctx, method, input, arguments)
+	s.observe(method, time.Since(started), result)
+	return result
+}
+
+// observe records the outcomes an operator cannot otherwise see. Successful,
+// prompt calls stay silent so the log remains readable under load.
+func (s *Server) observe(method string, elapsed time.Duration, result *mcp.CallToolResult) {
+	logf := s.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
+	threshold := s.SlowCallThreshold
+	if threshold <= 0 {
+		threshold = defaultSlowCallThreshold
+	}
+	switch {
+	case result.IsError:
+		logf("tool %s failed after %s: %s", method, elapsed.Round(time.Microsecond), resultText(result))
+	case elapsed >= threshold:
+		logf("tool %s succeeded after %s, past the %s mark where a client or proxy may already have abandoned the request",
+			method, elapsed.Round(time.Microsecond), threshold)
+	}
+}
+
+func resultText(result *mcp.CallToolResult) string {
+	for _, content := range result.Content {
+		if text, ok := content.(*mcp.TextContent); ok {
+			return text.Text
+		}
+	}
+	return "(no content)"
+}
+
+func (s *Server) dispatch(ctx context.Context, method string, input map[string]any, arguments json.RawMessage) *mcp.CallToolResult {
 	normalized, notes, err := normalizeArguments(method, input, arguments)
 	if err != nil {
 		return errorResult(method, err)

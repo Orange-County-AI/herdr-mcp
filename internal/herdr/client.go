@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,9 +17,15 @@ import (
 const maxResponseBytes = 64 << 20
 
 // Client performs one newline-delimited request/response exchange per socket connection.
+// Every call dials its own connection, so concurrent calls never queue behind
+// each other.
 type Client struct {
 	SocketPath string
-	sequence   atomic.Uint64
+	// CallTimeout overrides the per-method socket budget. Production leaves it
+	// nil and gets callTimeout; tests set it so a timeout case can be asserted
+	// on its message rather than on the clock.
+	CallTimeout func(method string, params json.RawMessage) time.Duration
+	sequence    atomic.Uint64
 }
 
 // APIError is an error returned by the Herdr socket server.
@@ -80,7 +87,9 @@ func (c *Client) Call(ctx context.Context, method string, params json.RawMessage
 	}
 	defer conn.Close()
 
-	deadline := time.Now().Add(callTimeout(method, params))
+	budget := c.callTimeout(method, params)
+	started := time.Now()
+	deadline := started.Add(budget)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
@@ -91,7 +100,7 @@ func (c *Client) Call(ctx context.Context, method string, params json.RawMessage
 	defer stopCancel()
 
 	if _, err := conn.Write(body); err != nil {
-		return nil, fmt.Errorf("write %s request: %w", method, err)
+		return nil, callFailure(ctx, method, time.Since(started), budget, err)
 	}
 	limited := io.LimitReader(conn, maxResponseBytes+1)
 	line, readErr := bufio.NewReader(limited).ReadBytes('\n')
@@ -99,7 +108,7 @@ func (c *Client) Call(ctx context.Context, method string, params json.RawMessage
 		return nil, fmt.Errorf("%s response exceeds %d bytes", method, maxResponseBytes)
 	}
 	if readErr != nil && len(line) == 0 {
-		return nil, fmt.Errorf("read %s response: %w", method, readErr)
+		return nil, callFailure(ctx, method, time.Since(started), budget, readErr)
 	}
 
 	var response struct {
@@ -140,6 +149,36 @@ func (c *Client) Ping(ctx context.Context) (version string, protocol int, err er
 		return "", 0, fmt.Errorf("ping returned invalid protocol %d", pong.Protocol)
 	}
 	return pong.Version, pong.Protocol, nil
+}
+
+// callFailure names the real cause of a socket write/read failure.
+//
+// Cancelling the context closes the connection out from under the in-flight
+// read, so the raw error is "use of closed network connection" -- which reads
+// as a Herdr fault when in fact the caller is the one that walked away. An
+// expired socket deadline is likewise reported as a bare "i/o timeout" that a
+// caller cannot tell apart from Herdr refusing the request. Both are the same
+// opaque failure from the outside, so both get attributed here.
+func callFailure(ctx context.Context, method string, elapsed, budget time.Duration, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		reason := "was cancelled by the caller"
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			reason = "hit the caller's deadline"
+		}
+		return fmt.Errorf("%s %s after %s; Herdr may still be running it: %w",
+			method, reason, elapsed.Round(time.Millisecond), ctxErr)
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return fmt.Errorf("Herdr did not answer %s within %s", method, budget.Round(time.Millisecond))
+	}
+	return fmt.Errorf("read %s response: %w", method, err)
+}
+
+func (c *Client) callTimeout(method string, params json.RawMessage) time.Duration {
+	if c.CallTimeout != nil {
+		return c.CallTimeout(method, params)
+	}
+	return callTimeout(method, params)
 }
 
 func callTimeout(method string, params json.RawMessage) time.Duration {
