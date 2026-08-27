@@ -7,8 +7,12 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=-%h/.config/herdr-mcp/env
 ExecStart=%h/.local/bin/herdr-mcp serve --listen 127.0.0.1:8091
-Restart=on-failure
+Restart=always
 RestartSec=3
+# Load-bearing: ProtectHome=read-only makes the schema cache unwritable, and
+# without that cache the bridge cannot register tools during an upgrade that
+# replaces the Herdr binary.
+CacheDirectory=herdr-mcp
 ProtectSystem=strict
 ProtectHome=read-only
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

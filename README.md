@@ -164,6 +164,59 @@ https://herdr-mcp.example.com/mcp
 
 Claude can add it as a remote HTTP MCP server. In ChatGPT, add the URL as a custom MCP-backed plugin/app. The first connection opens the Cloudflare Access login flow; no client secret is copied into either product.
 
+## Availability and queueing
+
+`serve` and `stdio` start whether or not Herdr is running, and stay up when it
+goes away. That covers the two windows where the bridge used to be unreachable
+at exactly the wrong moment: a Herdr restart, and an upgrade that swaps the
+`herdr` binary out from under it.
+
+**Starting without Herdr.** Tools come from `herdr api schema --json`, which
+needs the binary but not a running session. The parsed document is cached at
+`$XDG_CACHE_HOME/herdr-mcp/schema.json` on every successful read, so a start
+during an upgrade falls back to the cached copy and logs that it did. With
+neither a binary nor a cache there is no honest tool surface, and startup fails.
+
+**Calls wait instead of failing.** A call that cannot reach the socket is parked
+and released as soon as Herdr answers, so a restart shows up as latency rather
+than a wall of errors. One shared prober does the reconnecting, so a hundred
+parked callers are still one connection attempt every 500ms. Past
+`--outage-grace` a caller gives up with an error naming the outage and its
+duration. That grace is measured from each call's own arrival, so a call that
+lands an hour into an outage still gets a full period rather than an instant
+failure.
+
+**Only failed dials are retried.** Once a request is on the wire, a failure is
+ambiguous -- Herdr may have applied `pane_close` and died before answering --
+so it is reported, never resent. A failed dial wrote nothing, which is what
+makes it safe to retry.
+
+**Bursts are metered, not dropped.** `--max-concurrent` bounds simultaneous
+requests against Herdr; the rest queue. Long polls (`agent_wait`, `agent_prompt`,
+`events_wait`, `pane_wait_for_output`) hold a connection for minutes while
+consuming no Herdr capacity, so they get their own `--max-long-concurrent` lane
+and cannot starve ordinary calls. `--queue-depth` bounds each lane's waiting
+room; past it, new calls are shed immediately. That is deliberate: an unbounded
+queue during an outage only guarantees that everyone waits and then fails.
+
+**Health.** `GET /healthz` reports the bridge, with Herdr nested underneath:
+
+```json
+{"ok": true, "protocol": 20, "tools": 84,
+ "herdr": {"available": false, "down_for_seconds": 12, "waiting": 3, "in_flight": 8,
+           "detail": "Herdr socket unreachable; calls are parked until it returns"}}
+```
+
+`ok` now means the MCP endpoint is serving tools, which stopped being the same
+fact as "Herdr is up" the moment the bridge was allowed to outlive an outage.
+**A monitor that alerted on Herdr being down must watch `herdr.available`.**
+`ok` goes false, with HTTP 503, only when the bridge itself cannot serve
+correctly -- today that means Herdr came back on a different protocol than the
+one its registered tools were built from. Calls then return that mismatch with
+the fix (restart `herdr-mcp`) rather than sending well-formed requests with the
+wrong meaning. `doctor` is unchanged and still strict: it fails if the binary,
+the socket, or the protocols disagree.
+
 ## Method policy
 
 By default every non-streaming client-facing method in the selected Herdr schema is exposed. `events.subscribe` is omitted because a one-shot MCP tool call cannot preserve that streaming socket lifetime; use `events_wait` or `pane_wait_for_output` instead. Harness-internal lifecycle reporting (`pane.report_*`, `pane.release_agent`, and `pane.clear_agent_authority`) and terminal graphics (`pane.graphics.*`) are also omitted to keep client tool discovery focused on agent and pane control.
@@ -206,6 +259,10 @@ Common configuration:
 | `--listen` | `HERDR_MCP_LISTEN` | `127.0.0.1:8091` |
 | `--access-team-domain` | `CF_ACCESS_TEAM_DOMAIN` | unset |
 | `--access-aud` | `CF_ACCESS_AUD` | unset |
+| `--max-concurrent` | `HERDR_MCP_MAX_CONCURRENT` | `8` |
+| `--max-long-concurrent` | `HERDR_MCP_MAX_LONG_CONCURRENT` | `64` |
+| `--queue-depth` | `HERDR_MCP_QUEUE_DEPTH` | `256` |
+| `--outage-grace` | `HERDR_MCP_OUTAGE_GRACE` | `2m` |
 
 `serve` refuses non-loopback listeners. Remote access belongs behind a tunnel and an authorization policy, not on a public origin port.
 

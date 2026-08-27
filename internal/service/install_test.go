@@ -75,6 +75,13 @@ func TestInstallWritesAndStartsUserService(t *testing.T) {
 		"127.0.0.1:19091",
 		"/opt/herdr/bin/herdr",
 		"ProtectHome=read-only",
+		// ProtectHome=read-only would otherwise make the schema cache
+		// unwritable, and the bridge needs that cache to register tools while
+		// the Herdr binary is mid-upgrade.
+		"CacheDirectory=herdr-mcp",
+		// The bridge is built to outlive Herdr, so a crash should bring it back
+		// even while Herdr itself is down.
+		"Restart=always",
 	} {
 		if !strings.Contains(string(unit), expected) {
 			t.Errorf("unit does not contain %q:\n%s", expected, unit)

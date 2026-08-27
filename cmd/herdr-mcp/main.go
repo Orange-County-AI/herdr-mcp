@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,15 +23,34 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const version = "0.2.6"
+const version = "0.3.0"
+
+// schemaLoadBudget caps how long a degraded start waits on the Herdr binary
+// before falling back to the cached schema.
+const schemaLoadBudget = 20 * time.Second
 
 const defaultDenyMethods = "events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*"
 
 type commonFlags struct {
-	socket       string
-	herdrBinary  string
-	allowMethods string
-	denyMethods  string
+	socket          string
+	herdrBinary     string
+	allowMethods    string
+	denyMethods     string
+	concurrency     int
+	longConcurrency int
+	queueDepth      int
+	outageGrace     time.Duration
+}
+
+// runtimeBundle is what a successful startup produced, including the parts a
+// degraded startup could not verify.
+type runtimeBundle struct {
+	Server       *mcpserver.Server
+	Client       *herdr.Client
+	Queue        *herdr.Queue
+	HerdrVersion string
+	Protocol     int
+	Notes        []string
 }
 
 func main() {
@@ -88,12 +108,15 @@ func runServe(arguments []string) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	runtime, herdrVersion, err := buildRuntime(ctx, *common)
+	bundle, err := buildRuntime(ctx, *common, false)
 	if err != nil {
 		return err
 	}
+	for _, note := range bundle.Notes {
+		log.Printf("startup: %s", note)
+	}
 
-	var mcpHandler http.Handler = runtime.HTTPHandler()
+	var mcpHandler http.Handler = bundle.Server.HTTPHandler()
 	if *accessTeam != "" || *accessAudience != "" {
 		validator, err := access.NewValidator(*accessTeam, *accessAudience)
 		if err != nil {
@@ -107,7 +130,7 @@ func runServe(arguments []string) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcpHandler)
-	mux.HandleFunc("/healthz", healthHandler(runtime.Client, runtime.Schema.Protocol))
+	mux.HandleFunc("/healthz", healthHandler(bundle))
 
 	httpServer := &http.Server{
 		Addr:              *listen,
@@ -126,8 +149,10 @@ func runServe(arguments []string) error {
 		}
 	}()
 
-	log.Printf("herdr: version=%s protocol=%d socket=%s", herdrVersion, runtime.Schema.Protocol, runtime.Client.SocketPath)
-	log.Printf("mcp: %d tools at http://%s/mcp", len(runtime.Methods), *listen)
+	log.Printf("herdr: version=%s protocol=%d socket=%s", describeVersion(bundle.HerdrVersion), bundle.Protocol, bundle.Client.SocketPath)
+	log.Printf("queue: %d concurrent, %d long-poll, %d queued per lane, %s outage grace",
+		common.concurrency, common.longConcurrency, common.queueDepth, common.outageGrace)
+	log.Printf("mcp: %d tools at http://%s/mcp", len(bundle.Server.Methods), *listen)
 	err = httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		<-shutdownDone
@@ -149,12 +174,15 @@ func runStdio(arguments []string) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	runtime, herdrVersion, err := buildRuntime(ctx, *common)
+	bundle, err := buildRuntime(ctx, *common, false)
 	if err != nil {
 		return err
 	}
-	log.Printf("herdr: version=%s protocol=%d socket=%s tools=%d", herdrVersion, runtime.Schema.Protocol, runtime.Client.SocketPath, len(runtime.Methods))
-	return runtime.MCP.Run(ctx, &mcp.StdioTransport{})
+	for _, note := range bundle.Notes {
+		log.Printf("startup: %s", note)
+	}
+	log.Printf("herdr: version=%s protocol=%d socket=%s tools=%d", describeVersion(bundle.HerdrVersion), bundle.Protocol, bundle.Client.SocketPath, len(bundle.Server.Methods))
+	return bundle.Server.MCP.Run(ctx, &mcp.StdioTransport{})
 }
 
 func runDoctor(arguments []string) error {
@@ -170,16 +198,16 @@ func runDoctor(arguments []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	runtime, herdrVersion, err := buildRuntime(ctx, *common)
+	bundle, err := buildRuntime(ctx, *common, true)
 	if err != nil {
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(map[string]any{
-		"herdr_version":     herdrVersion,
-		"protocol":          runtime.Schema.Protocol,
-		"schema_version":    runtime.Schema.SchemaVersion,
-		"socket":            runtime.Client.SocketPath,
-		"tools":             len(runtime.Methods),
+		"herdr_version":     bundle.HerdrVersion,
+		"protocol":          bundle.Server.Schema.Protocol,
+		"schema_version":    bundle.Server.Schema.SchemaVersion,
+		"socket":            bundle.Client.SocketPath,
+		"tools":             len(bundle.Server.Methods),
 		"herdr_mcp_version": version,
 	})
 }
@@ -231,50 +259,153 @@ func addCommonFlags(flags *flag.FlagSet) *commonFlags {
 	flags.StringVar(&common.socket, "socket", defaultSocket, "Herdr API socket path")
 	flags.StringVar(&common.herdrBinary, "herdr-bin", envDefault("HERDR_BIN", "herdr"), "Herdr binary used to load the API schema")
 	flags.StringVar(&common.denyMethods, "deny-methods", envDefault("HERDR_MCP_DENY_METHODS", defaultDenyMethods), "comma-separated method globs to omit")
+	flags.IntVar(&common.concurrency, "max-concurrent", envInt("HERDR_MCP_MAX_CONCURRENT", 8), "simultaneous Herdr calls; further calls queue")
+	flags.IntVar(&common.longConcurrency, "max-long-concurrent", envInt("HERDR_MCP_MAX_LONG_CONCURRENT", 64), "simultaneous long-poll calls (agent_wait, events_wait, pane_wait_for_output, agent_prompt)")
+	flags.IntVar(&common.queueDepth, "queue-depth", envInt("HERDR_MCP_QUEUE_DEPTH", 256), "calls allowed to wait per lane before new ones are shed")
+	flags.DurationVar(&common.outageGrace, "outage-grace", envDuration("HERDR_MCP_OUTAGE_GRACE", 2*time.Minute), "how long a call waits for an unreachable Herdr before failing")
 	return common
 }
 
-func buildRuntime(ctx context.Context, flags commonFlags) (*mcpserver.Server, string, error) {
-	schema, err := herdr.LoadSchema(ctx, flags.herdrBinary)
-	if err != nil {
-		return nil, "", err
+// buildRuntime prepares the MCP tool surface. In strict mode (doctor) every
+// dependency must be present and agreeing. Otherwise the bridge starts anyway:
+// a missing Herdr binary falls back to the cached schema, an unreachable socket
+// becomes a parked queue rather than a failed boot, and a protocol that has
+// moved on is reported per call instead of crashing the process into a systemd
+// restart loop. The whole point is that the MCP endpoint stays answerable while
+// Herdr is not.
+func buildRuntime(ctx context.Context, flags commonFlags, strict bool) (*runtimeBundle, error) {
+	bundle := &runtimeBundle{}
+
+	var schema *herdr.Schema
+	var err error
+	if strict {
+		schema, err = herdr.LoadSchema(ctx, flags.herdrBinary)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		cache, cacheErr := herdr.DefaultSchemaCache()
+		if cacheErr != nil {
+			bundle.Notes = append(bundle.Notes, cacheErr.Error())
+		}
+		// A wedged `herdr api schema` must not hold the bridge down forever;
+		// past this budget the cached schema is the better answer.
+		schemaCtx, cancelSchema := context.WithTimeout(ctx, schemaLoadBudget)
+		var note string
+		schema, note, err = herdr.LoadSchemaCached(schemaCtx, flags.herdrBinary, cache)
+		cancelSchema()
+		if err != nil {
+			return nil, err
+		}
+		if note != "" {
+			bundle.Notes = append(bundle.Notes, note)
+		}
 	}
+	bundle.Protocol = schema.Protocol
+
 	client := &herdr.Client{SocketPath: flags.socket}
-	herdrVersion, protocol, err := client.Ping(ctx)
+	bundle.Client = client
+	queue := herdr.NewQueue(ctx, client, schema.Protocol)
+	queue.Concurrency = flags.concurrency
+	queue.LongConcurrency = flags.longConcurrency
+	queue.Backlog = flags.queueDepth
+	queue.OutageGrace = flags.outageGrace
+	bundle.Queue = queue
+
+	herdrVersion, protocol, pingErr := client.Ping(ctx)
+	switch {
+	case pingErr != nil && strict:
+		return nil, pingErr
+	case pingErr != nil:
+		queue.MarkUnreachable(pingErr)
+		bundle.Notes = append(bundle.Notes, fmt.Sprintf("Herdr socket %s is not answering yet (%v); tools are registered and calls will wait for it", flags.socket, pingErr))
+	case protocol != schema.Protocol && strict:
+		return nil, fmt.Errorf("protocol mismatch: %s reports schema protocol %d, socket reports %d", flags.herdrBinary, schema.Protocol, protocol)
+	default:
+		queue.MarkObserved(protocol)
+		bundle.HerdrVersion = herdrVersion
+		if protocol != schema.Protocol {
+			bundle.Notes = append(bundle.Notes, fmt.Sprintf("protocol mismatch: schema protocol %d, socket protocol %d; tool calls will report this until herdr-mcp restarts", schema.Protocol, protocol))
+		}
+	}
+
+	server, err := mcpserver.New(schema, queue, version, splitCSV(flags.allowMethods), splitCSV(flags.denyMethods))
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	if protocol != schema.Protocol {
-		return nil, "", fmt.Errorf("protocol mismatch: %s reports schema protocol %d, socket reports %d", flags.herdrBinary, schema.Protocol, protocol)
-	}
-	runtime, err := mcpserver.New(schema, client, version, splitCSV(flags.allowMethods), splitCSV(flags.denyMethods))
-	if err != nil {
-		return nil, "", err
-	}
-	return runtime, herdrVersion, nil
+	bundle.Server = server
+	return bundle, nil
 }
 
-func healthHandler(client *herdr.Client, expectedProtocol int) http.HandlerFunc {
+// healthHandler reports the bridge's own health, with Herdr's reachability
+// nested underneath.
+//
+// The split matters: "ok" now means the MCP endpoint is serving tools, not that
+// Herdr is up, because those became different facts the moment the bridge was
+// allowed to outlive an outage. A monitor that used to alert on Herdr being
+// down must watch herdr.available instead. Only a bridge that cannot serve
+// correctly -- today, a protocol that moved out from under its tools -- still
+// answers 503.
+func healthHandler(bundle *runtimeBundle) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "GET required", http.StatusMethodNotAllowed)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-		defer cancel()
-		version, protocol, err := client.Ping(ctx)
+		status := bundle.Queue.Availability()
+		if !status.Available {
+			// A live probe costs nothing here and shortens the window between
+			// Herdr returning and /healthz admitting it.
+			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			if _, protocol, err := bundle.Client.Ping(ctx); err == nil {
+				bundle.Queue.MarkObserved(protocol)
+				status = bundle.Queue.Availability()
+			}
+			cancel()
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if err != nil || protocol != expectedProtocol {
+		if status.ProtocolMismatch {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false})
-			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":       true,
+			"ok":       !status.ProtocolMismatch,
 			"version":  version,
-			"protocol": protocol,
+			"protocol": bundle.Protocol,
+			"tools":    len(bundle.Server.Methods),
+			"herdr":    status,
 		})
 	}
+}
+
+func describeVersion(herdrVersion string) string {
+	if herdrVersion == "" {
+		return "unreachable"
+	}
+	return herdrVersion
+}
+
+func envInt(name string, fallback int) int {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envDuration(name string, fallback time.Duration) time.Duration {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func validateListen(address string) error {

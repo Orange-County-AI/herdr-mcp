@@ -41,6 +41,24 @@ func (e *APIError) Error() string {
 	return e.Code + ": " + e.Message
 }
 
+// UnavailableError reports that a call never reached Herdr: the dial itself
+// failed, so not one byte of the request was written.
+//
+// That distinction is what makes a retry safe. Once the request is on the wire
+// a failure is ambiguous -- Herdr may have applied pane.close and died before
+// answering -- and resending it could apply the mutation twice. A failed dial
+// carries no such ambiguity, so this is the only error the queue retries.
+type UnavailableError struct {
+	SocketPath string
+	Err        error
+}
+
+func (e *UnavailableError) Error() string {
+	return fmt.Sprintf("connect to Herdr socket %s: %v", e.SocketPath, e.Err)
+}
+
+func (e *UnavailableError) Unwrap() error { return e.Err }
+
 // DefaultSocketPath follows Herdr's default-session socket convention.
 func DefaultSocketPath() (string, error) {
 	if path := os.Getenv("HERDR_SOCKET_PATH"); path != "" {
@@ -83,7 +101,7 @@ func (c *Client) Call(ctx context.Context, method string, params json.RawMessage
 	dialer := net.Dialer{Timeout: 2 * time.Second}
 	conn, err := dialer.DialContext(ctx, "unix", c.SocketPath)
 	if err != nil {
-		return nil, fmt.Errorf("connect to Herdr socket %s: %w", c.SocketPath, err)
+		return nil, &UnavailableError{SocketPath: c.SocketPath, Err: err}
 	}
 	defer conn.Close()
 

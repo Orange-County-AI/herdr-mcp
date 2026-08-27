@@ -31,12 +31,19 @@ events_subscribe and harness-internal lifecycle reporting are intentionally omit
 // sees a success, and only the log connects the two.
 const defaultSlowCallThreshold = 60 * time.Second
 
+// Caller is the Herdr transport tool calls dispatch through. Production passes
+// a *herdr.Queue so calls are admission-controlled and survive an outage; tests
+// pass a bare *herdr.Client.
+type Caller interface {
+	Call(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error)
+}
+
 // Server wraps a dynamically registered MCP server and its source schema.
 type Server struct {
 	MCP     *mcp.Server
 	Schema  *herdr.Schema
 	Methods []herdr.MethodDefinition
-	Client  *herdr.Client
+	Client  Caller
 	Version string
 	// Logf receives one line per failed or slow tool call. Tool failures travel
 	// to the client inside the result content, and some clients render an
@@ -48,7 +55,7 @@ type Server struct {
 }
 
 // New registers one MCP tool for every selected method in the Herdr request schema.
-func New(schema *herdr.Schema, client *herdr.Client, version string, allow, deny []string) (*Server, error) {
+func New(schema *herdr.Schema, client Caller, version string, allow, deny []string) (*Server, error) {
 	methods, err := schema.Methods(allow, deny)
 	if err != nil {
 		return nil, err

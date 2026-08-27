@@ -247,6 +247,14 @@ func writeFileAtomic(path string, content []byte, mode os.FileMode) error {
 }
 
 func unitBody(result Result, herdrBinary, listen string) string {
+	// The bridge deliberately outlives Herdr, so nothing here binds its
+	// lifetime to herdr.service beyond start ordering, and Restart=always
+	// covers a crash even while Herdr is down.
+	//
+	// CacheDirectory is load-bearing, not hygiene: ProtectHome=read-only makes
+	// the schema cache unwritable, and without that cache the bridge cannot
+	// register tools during an upgrade that replaces the Herdr binary -- which
+	// is one of the outages it exists to cover.
 	return fmt.Sprintf(`[Unit]
 Description=Herdr socket API MCP bridge
 After=network-online.target herdr.service
@@ -256,8 +264,9 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=-%s
 ExecStart=%s serve --listen %s --herdr-bin %s
-Restart=on-failure
+Restart=always
 RestartSec=3
+CacheDirectory=herdr-mcp
 ProtectSystem=strict
 ProtectHome=read-only
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

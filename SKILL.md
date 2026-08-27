@@ -133,6 +133,36 @@ For remote Claude or ChatGPT access:
 
 Cloudflare owns the authorization-code + PKCE flow. Do not put a second origin OAuth server behind Access Managed OAuth. Keep the tunnel origin loopback-only and do not open a firewall port.
 
+## Expect it to outlive Herdr
+
+`serve` and `stdio` start whether or not Herdr is running, and stay up when it
+stops. Do not read a failed `herdr-mcp` start as "Herdr is down" any more.
+
+- **Tools** come from `herdr api schema --json` and are cached at
+  `$XDG_CACHE_HOME/herdr-mcp/schema.json`, so a start during an upgrade that
+  replaced the binary falls back to that cache and says so in the log. Startup
+  fails only when neither the binary nor the cache can supply a schema.
+- **Calls park** while the socket is unreachable and resume when it answers, so
+  a Herdr restart costs latency rather than failed tool calls. Past
+  `--outage-grace` (default `2m`) a call fails with an error naming the outage
+  and how long it has lasted.
+- **A call that already reached Herdr is never resent.** Only a failed dial is
+  retried, because only a failed dial is known not to have applied anything.
+- **Bursts queue.** `--max-concurrent` (8) bounds simultaneous requests;
+  long polls get a separate `--max-long-concurrent` (64) lane so they cannot
+  starve ordinary calls. Past `--queue-depth` (256) waiting calls, new ones are
+  shed with a saturation error rather than joining a queue that will only time
+  out.
+- **`/healthz` `ok` means the bridge is serving, not that Herdr is up.** Read
+  `herdr.available`, `herdr.down_for_seconds`, `herdr.waiting`, and
+  `herdr.in_flight`. `ok:false` with HTTP 503 means the bridge itself cannot
+  serve correctly -- currently only a Herdr protocol that no longer matches its
+  registered tools, fixed by restarting `herdr-mcp`.
+
+`doctor` is unchanged and stays strict: it fails when the binary is missing, the
+socket is unreachable, or the protocols disagree. Use it, not `/healthz`, to
+answer "is Herdr actually reachable right now".
+
 ## Treat the tool surface as privileged
 
 The generated tools directly control Herdr. The full schema includes destructive methods such as `server_stop`, `worktree_remove`, `pane_close`, plugin unlinking, and integration uninstalling.
@@ -141,8 +171,10 @@ Before exposing a server to another user or agent, decide whether it needs the f
 
 ## Diagnose failures
 
-- **Socket connection failure:** confirm Herdr is running and inspect `HERDR_SOCKET_PATH`.
-- **Protocol mismatch:** ensure `HERDR_BIN` and the running Herdr server are the same release, then rerun `doctor`.
+- **Socket connection failure:** confirm Herdr is running and inspect `HERDR_SOCKET_PATH`. Tool calls report this only after `--outage-grace` elapses; `herdr-mcp doctor` and `/healthz`'s `herdr.available` answer immediately.
+- **Protocol mismatch:** ensure `HERDR_BIN` and the running Herdr server are the same release, then rerun `doctor`. If Herdr changed protocol while the bridge was running, every call reports it and `/healthz` returns 503 until `herdr-mcp` restarts and re-reads the schema.
+- **Calls fail with "queue is saturated":** more than `--queue-depth` calls are already waiting per lane. Check `/healthz` `herdr.waiting`; if Herdr is up, raise `--max-concurrent`, and if it is down, fix that first.
+- **Tools are registered but stale:** the log says `using cached Herdr schema`. The `herdr` binary named by `--herdr-bin` could not answer; restart the service once it can.
 - **Service starts in a shell but not systemd:** inspect the unit's resolved `--herdr-bin` and the environment file; do not rely on shell-only PATH setup.
 - **Remote client receives redirects or cannot register:** enable Cloudflare Access Managed OAuth on the protected application.
 - **Origin returns `missing Cloudflare Access assertion`:** verify the request traversed the Access application and that its audience matches `CF_ACCESS_AUD`.

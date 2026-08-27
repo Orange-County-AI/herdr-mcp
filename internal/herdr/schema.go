@@ -27,6 +27,14 @@ type MethodDefinition struct {
 
 // LoadSchema asks the selected Herdr binary for the protocol schema it was built with.
 func LoadSchema(ctx context.Context, binary string) (*Schema, error) {
+	output, err := loadSchemaBytes(ctx, binary)
+	if err != nil {
+		return nil, err
+	}
+	return ParseSchema(output)
+}
+
+func loadSchemaBytes(ctx context.Context, binary string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, binary, "api", "schema", "--json")
 	output, err := cmd.Output()
 	if err != nil {
@@ -35,7 +43,7 @@ func LoadSchema(ctx context.Context, binary string) (*Schema, error) {
 		}
 		return nil, fmt.Errorf("%s api schema --json: %w", binary, err)
 	}
-	return ParseSchema(output)
+	return output, nil
 }
 
 // ParseSchema parses Herdr's versioned API schema document.
