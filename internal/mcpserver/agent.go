@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/Orange-County-AI/herdr-mcp/internal/herdr"
 )
 
 const defaultAgentStartupTimeout = 30 * time.Second
 
-func (s *Server) waitForStartedAgent(ctx context.Context, startResult json.RawMessage, arguments json.RawMessage) (json.RawMessage, string, error) {
+func (s *Server) waitForStartedAgent(ctx context.Context, caller herdr.Transport, startResult json.RawMessage, arguments json.RawMessage) (json.RawMessage, string, error) {
 	target := stringArgument(arguments, "name")
 	if target == "" {
 		return startResult, "", nil
 	}
-	agent, err := s.waitForAgentReady(ctx, target, argumentTimeout(arguments, defaultAgentStartupTimeout))
+	agent, err := s.waitForAgentReady(ctx, caller, target, argumentTimeout(arguments, defaultAgentStartupTimeout))
 	if err != nil {
 		return startResult, fmt.Sprintf("Agent %q started but is still launching. Use agent_wait with target %q before agent_prompt; its pane is available for raw terminal input.", target, target), nil
 	}
@@ -30,38 +32,38 @@ func (s *Server) waitForStartedAgent(ctx context.Context, startResult json.RawMe
 	return updated, "", nil
 }
 
-func (s *Server) waitThroughLaunch(ctx context.Context, arguments json.RawMessage) error {
+func (s *Server) waitThroughLaunch(ctx context.Context, caller herdr.Transport, arguments json.RawMessage) error {
 	target := stringArgument(arguments, "target")
 	if target == "" {
 		return nil
 	}
-	launching, _, err := s.launchingAgent(ctx, target)
+	launching, _, err := s.launchingAgent(ctx, caller, target)
 	if err != nil || !launching {
 		return nil
 	}
-	_, err = s.waitForAgentReady(ctx, target, argumentTimeout(arguments, defaultAgentStartupTimeout))
+	_, err = s.waitForAgentReady(ctx, caller, target, argumentTimeout(arguments, defaultAgentStartupTimeout))
 	if err != nil {
 		return fmt.Errorf("agent %q is still launching; %w", target, err)
 	}
 	return nil
 }
 
-func (s *Server) enrichAgentError(ctx context.Context, method string, arguments json.RawMessage, err error) error {
+func (s *Server) enrichAgentError(ctx context.Context, caller herdr.Transport, method string, arguments json.RawMessage, err error) error {
 	target := stringArgument(arguments, "target")
 	if target == "" {
 		return err
 	}
-	launching, paneID, lookupErr := s.launchingAgent(ctx, target)
+	launching, paneID, lookupErr := s.launchingAgent(ctx, caller, target)
 	if lookupErr != nil || !launching {
 		return err
 	}
 	return fmt.Errorf("%w; agent %q is still launching (launch_pending=true, pane_id=%q). Wait with agent_wait before prompting, or use pane_send_keys with that pane_id for raw terminal input", err, target, paneID)
 }
 
-func (s *Server) waitForAgentReady(ctx context.Context, target string, timeout time.Duration) (map[string]any, error) {
+func (s *Server) waitForAgentReady(ctx context.Context, caller herdr.Transport, target string, timeout time.Duration) (map[string]any, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		result, err := s.Client.Call(ctx, "agent.get", json.RawMessage(fmt.Sprintf(`{"target":%q}`, target)))
+		result, err := caller.Call(ctx, "agent.get", json.RawMessage(fmt.Sprintf(`{"target":%q}`, target)))
 		if err == nil {
 			var response struct {
 				Agent map[string]any `json:"agent"`
@@ -83,8 +85,8 @@ func (s *Server) waitForAgentReady(ctx context.Context, target string, timeout t
 	}
 }
 
-func (s *Server) launchingAgent(ctx context.Context, target string) (bool, string, error) {
-	result, err := s.Client.Call(ctx, "agent.list", nil)
+func (s *Server) launchingAgent(ctx context.Context, caller herdr.Transport, target string) (bool, string, error) {
+	result, err := caller.Call(ctx, "agent.list", nil)
 	if err != nil {
 		return false, "", err
 	}

@@ -81,7 +81,9 @@ type Queue struct {
 
 	// protocol is the last protocol a successful probe observed, and mismatch
 	// records that it disagreed with the schema the tools were built from.
-	expectProtocol int
+	// expectProtocol is atomic because a schema hot-reload re-points it while
+	// calls are already reading it.
+	expectProtocol atomic.Int64
 	lastProtocol   atomic.Int64
 	mismatch       atomic.Bool
 
@@ -105,7 +107,19 @@ type Availability struct {
 // from, and a probe that disagrees with it marks the bridge mismatched rather
 // than letting it serve tools that no longer match the running Herdr.
 func NewQueue(stop context.Context, client *Client, expectProtocol int) *Queue {
-	return &Queue{Client: client, expectProtocol: expectProtocol, stop: stop}
+	queue := &Queue{Client: client, stop: stop}
+	queue.expectProtocol.Store(int64(expectProtocol))
+	return queue
+}
+
+// SetExpectedProtocol re-points the queue at the protocol of a freshly
+// registered schema and clears any mismatch recorded against the old one. A
+// hot reload is precisely the case where a mismatch has just been resolved,
+// and leaving the flag set would keep failing every call.
+func (q *Queue) SetExpectedProtocol(protocol int) {
+	q.init()
+	q.expectProtocol.Store(int64(protocol))
+	q.mismatch.Store(false)
 }
 
 func (q *Queue) init() {
@@ -124,7 +138,7 @@ func (q *Queue) Call(ctx context.Context, method string, params json.RawMessage)
 	q.init()
 	if q.mismatch.Load() {
 		return nil, fmt.Errorf("herdr-mcp built its tools from protocol %d but the running Herdr reports protocol %d; restart herdr-mcp so it re-reads the schema",
-			q.expectProtocol, q.lastProtocol.Load())
+			q.expectProtocol.Load(), q.lastProtocol.Load())
 	}
 
 	lane := q.short
@@ -231,9 +245,10 @@ func (q *Queue) markUp(protocol int) {
 	defer q.mu.Unlock()
 	if protocol > 0 {
 		q.lastProtocol.Store(int64(protocol))
-		if q.expectProtocol > 0 && protocol != q.expectProtocol {
+		expected := int(q.expectProtocol.Load())
+		if expected > 0 && protocol != expected {
 			if q.mismatch.CompareAndSwap(false, true) {
-				q.logf("herdr: protocol changed from %d to %d; tools are stale until herdr-mcp restarts", q.expectProtocol, protocol)
+				q.logf("herdr: protocol changed from %d to %d; tools are stale until herdr-mcp re-reads the schema", expected, protocol)
 			}
 		} else {
 			q.mismatch.Store(false)
@@ -292,7 +307,7 @@ func (q *Queue) Availability() Availability {
 	status := Availability{
 		Available:        !down,
 		Protocol:         int(q.lastProtocol.Load()),
-		ExpectedProtocol: q.expectProtocol,
+		ExpectedProtocol: int(q.expectProtocol.Load()),
 		ProtocolMismatch: q.mismatch.Load(),
 		Waiting:          q.short.waitingNow() + q.long.waitingNow(),
 		InFlight:         q.short.inFlightNow() + q.long.inFlightNow(),

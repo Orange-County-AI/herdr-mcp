@@ -23,7 +23,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 // schemaLoadBudget caps how long a degraded start waits on the Herdr binary
 // before falling back to the cached schema.
@@ -40,6 +40,9 @@ type commonFlags struct {
 	longConcurrency int
 	queueDepth      int
 	outageGrace     time.Duration
+	machines        bool
+	machineIdle     time.Duration
+	schemaRefresh   time.Duration
 }
 
 // runtimeBundle is what a successful startup produced, including the parts a
@@ -48,8 +51,10 @@ type runtimeBundle struct {
 	Server       *mcpserver.Server
 	Client       *herdr.Client
 	Queue        *herdr.Queue
+	Machines     *herdr.Pool
 	HerdrVersion string
 	Protocol     int
+	SchemaDigest string
 	Notes        []string
 }
 
@@ -149,10 +154,14 @@ func runServe(arguments []string) error {
 		}
 	}()
 
+	go watchSchema(ctx, bundle, *common)
+	defer closeMachines(bundle)
+
 	log.Printf("herdr: version=%s protocol=%d socket=%s", describeVersion(bundle.HerdrVersion), bundle.Protocol, bundle.Client.SocketPath)
 	log.Printf("queue: %d concurrent, %d long-poll, %d queued per lane, %s outage grace",
 		common.concurrency, common.longConcurrency, common.queueDepth, common.outageGrace)
-	log.Printf("mcp: %d tools at http://%s/mcp", len(bundle.Server.Methods), *listen)
+	log.Printf("machines: %s", describeMachineRouting(ctx, bundle, *common))
+	log.Printf("mcp: %d tools at http://%s/mcp", bundle.Server.ToolCount(), *listen)
 	err = httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		<-shutdownDone
@@ -181,7 +190,10 @@ func runStdio(arguments []string) error {
 	for _, note := range bundle.Notes {
 		log.Printf("startup: %s", note)
 	}
-	log.Printf("herdr: version=%s protocol=%d socket=%s tools=%d", describeVersion(bundle.HerdrVersion), bundle.Protocol, bundle.Client.SocketPath, len(bundle.Server.Methods))
+	go watchSchema(ctx, bundle, *common)
+	defer closeMachines(bundle)
+	log.Printf("herdr: version=%s protocol=%d socket=%s tools=%d", describeVersion(bundle.HerdrVersion), bundle.Protocol, bundle.Client.SocketPath, bundle.Server.ToolCount())
+	log.Printf("machines: %s", describeMachineRouting(ctx, bundle, *common))
 	return bundle.Server.MCP.Run(ctx, &mcp.StdioTransport{})
 }
 
@@ -202,14 +214,22 @@ func runDoctor(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	return json.NewEncoder(os.Stdout).Encode(map[string]any{
+	report := map[string]any{
 		"herdr_version":     bundle.HerdrVersion,
 		"protocol":          bundle.Server.Schema.Protocol,
 		"schema_version":    bundle.Server.Schema.SchemaVersion,
+		"schema_digest":     bundle.Server.Schema.Digest,
 		"socket":            bundle.Client.SocketPath,
-		"tools":             len(bundle.Server.Methods),
+		"tools":             bundle.Server.ToolCount(),
 		"herdr_mcp_version": version,
-	})
+	}
+	if bundle.Machines != nil {
+		defer closeMachines(bundle)
+		report["machines"] = bundle.Machines.Status(ctx)
+	} else {
+		report["machines"] = nil
+	}
+	return json.NewEncoder(os.Stdout).Encode(report)
 }
 
 func runInstallService(arguments []string) error {
@@ -263,6 +283,9 @@ func addCommonFlags(flags *flag.FlagSet) *commonFlags {
 	flags.IntVar(&common.longConcurrency, "max-long-concurrent", envInt("HERDR_MCP_MAX_LONG_CONCURRENT", 64), "simultaneous long-poll calls (agent_wait, events_wait, pane_wait_for_output, agent_prompt)")
 	flags.IntVar(&common.queueDepth, "queue-depth", envInt("HERDR_MCP_QUEUE_DEPTH", 256), "calls allowed to wait per lane before new ones are shed")
 	flags.DurationVar(&common.outageGrace, "outage-grace", envDuration("HERDR_MCP_OUTAGE_GRACE", 2*time.Minute), "how long a call waits for an unreachable Herdr before failing")
+	flags.BoolVar(&common.machines, "machines", envBool("HERDR_MCP_MACHINES", true), "accept a \"machine\" argument routing calls to saved Herdr SSH machines")
+	flags.DurationVar(&common.machineIdle, "machine-idle", envDuration("HERDR_MCP_MACHINE_IDLE", 15*time.Minute), "disconnect a saved machine untouched for this long; negative keeps it until shutdown")
+	flags.DurationVar(&common.schemaRefresh, "schema-refresh", envDuration("HERDR_MCP_SCHEMA_REFRESH", 5*time.Minute), "how often to re-read Herdr's schema and reload the tools if it changed; zero disables")
 	return common
 }
 
@@ -329,12 +352,94 @@ func buildRuntime(ctx context.Context, flags commonFlags, strict bool) (*runtime
 		}
 	}
 
-	server, err := mcpserver.New(schema, queue, version, splitCSV(flags.allowMethods), splitCSV(flags.denyMethods))
+	options := mcpserver.Options{
+		Schema:  schema,
+		Client:  queue,
+		Version: version,
+		Allow:   splitCSV(flags.allowMethods),
+		Deny:    splitCSV(flags.denyMethods),
+	}
+	if flags.machines {
+		runtimeDir, dirErr := herdr.DefaultRuntimeDir()
+		if dirErr != nil {
+			// Routing is an addition, not a precondition: a bridge that cannot
+			// place its forwarded sockets must still serve the local session.
+			bundle.Notes = append(bundle.Notes, fmt.Sprintf("machine routing disabled: %v", dirErr))
+		} else {
+			pool := herdr.NewPool(ctx, flags.herdrBinary, schema.Protocol, runtimeDir)
+			pool.IdleTimeout = flags.machineIdle
+			pool.Tune = func(remote *herdr.Queue) {
+				remote.Concurrency = flags.concurrency
+				remote.LongConcurrency = flags.longConcurrency
+				remote.Backlog = flags.queueDepth
+				remote.OutageGrace = flags.outageGrace
+			}
+			bundle.Machines = pool
+			options.Machines = pool
+		}
+	}
+
+	server, err := mcpserver.New(options)
 	if err != nil {
 		return nil, err
 	}
 	bundle.Server = server
+	bundle.SchemaDigest = schema.Digest
 	return bundle, nil
+}
+
+// watchSchema re-reads Herdr's schema on an interval and hot-swaps the tool
+// surface when the document changed.
+//
+// The protocol number alone does not catch this. Herdr 0.9.1 added
+// pane.link.resolve inside protocol 22, so a bridge started against 0.9.0 kept
+// reporting a matching protocol while serving one tool fewer than the running
+// Herdr had -- for a week, with nothing in /healthz to say so. Herdr updates
+// itself, so a bridge that only picks up a new surface on restart is a bridge
+// that is quietly wrong most of the time.
+func watchSchema(ctx context.Context, bundle *runtimeBundle, flags commonFlags) {
+	if flags.schemaRefresh <= 0 {
+		return
+	}
+	cache, _ := herdr.DefaultSchemaCache()
+	ticker := time.NewTicker(flags.schemaRefresh)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		loadCtx, cancel := context.WithTimeout(ctx, schemaLoadBudget)
+		schema, _, err := herdr.LoadSchemaCached(loadCtx, flags.herdrBinary, cache)
+		cancel()
+		if err != nil || schema == nil || schema.Digest == bundle.SchemaDigest {
+			continue
+		}
+		added, removed, reloadErr := bundle.Server.Reload(schema)
+		if reloadErr != nil {
+			log.Printf("schema: Herdr's schema changed but the new tools could not be registered, keeping the old ones: %v", reloadErr)
+			continue
+		}
+		bundle.SchemaDigest = schema.Digest
+		bundle.Protocol = schema.Protocol
+		bundle.Queue.SetExpectedProtocol(schema.Protocol)
+		if bundle.Machines != nil {
+			// Every forwarded machine was verified against the old protocol.
+			// Drop them so the next call re-probes and re-checks.
+			bundle.Machines.Protocol = schema.Protocol
+			bundle.Machines.Close()
+		}
+		log.Printf("schema: reloaded at protocol %d (%s): %d tools, added %s, removed %s",
+			schema.Protocol, schema.Digest[:19], bundle.Server.ToolCount(), describeList(added), describeList(removed))
+	}
+}
+
+func describeList(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
 }
 
 // healthHandler reports the bridge's own health, with Herdr's reachability
@@ -367,14 +472,49 @@ func healthHandler(bundle *runtimeBundle) http.HandlerFunc {
 		if status.ProtocolMismatch {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":       !status.ProtocolMismatch,
-			"version":  version,
-			"protocol": bundle.Protocol,
-			"tools":    len(bundle.Server.Methods),
-			"herdr":    status,
-		})
+		payload := map[string]any{
+			"ok":            !status.ProtocolMismatch,
+			"version":       version,
+			"protocol":      bundle.Protocol,
+			"schema_digest": bundle.SchemaDigest,
+			"tools":         bundle.Server.ToolCount(),
+			"herdr":         status,
+		}
+		if bundle.Machines != nil {
+			// Status never dials, so reporting cannot cost a handshake to a
+			// sleeping laptop -- /healthz must stay cheap enough to poll.
+			payload["machines"] = bundle.Machines.Status(r.Context())
+		}
+		_ = json.NewEncoder(w).Encode(payload)
 	}
+}
+
+// closeMachines tears down every forwarded SSH connection. Left alone they
+// outlive the process: the control masters are backgrounded with -fNT and are
+// nobody's child.
+func closeMachines(bundle *runtimeBundle) {
+	if bundle.Machines != nil {
+		bundle.Machines.Close()
+	}
+}
+
+func describeMachineRouting(ctx context.Context, bundle *runtimeBundle, flags commonFlags) string {
+	if bundle.Machines == nil {
+		return "routing disabled; tools target the local session only"
+	}
+	listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	machines, err := bundle.Machines.Machines(listCtx)
+	if err != nil {
+		return fmt.Sprintf("routing enabled, but the saved machines could not be listed: %v", err)
+	}
+	enabled := 0
+	for _, machine := range machines {
+		if machine.Enabled {
+			enabled++
+		}
+	}
+	return fmt.Sprintf("%d saved, %d enabled; connected on first use, dropped after %s idle", len(machines), enabled, flags.machineIdle)
 }
 
 func describeVersion(herdrVersion string) string {
@@ -391,6 +531,18 @@ func envInt(name string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envBool(name string, fallback bool) bool {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
 		return fallback
 	}
 	return parsed
@@ -449,6 +601,9 @@ usage:
   herdr-mcp doctor [flags]           verify schema/socket compatibility
   herdr-mcp install-service [flags]  install and start a systemd user service
   herdr-mcp version
+
+Tools take an optional "machine" argument naming a saved Herdr SSH machine
+(see machine_list); omit it for the local session.
 
 Run "herdr-mcp <command> -h" for command flags.`)
 }

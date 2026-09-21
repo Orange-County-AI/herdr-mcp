@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Orange-County-AI/herdr-mcp/internal/herdr"
@@ -22,7 +24,9 @@ Read source values are visible (rendered viewport), recent (scrollback with soft
 Use session_snapshot or the list methods to discover stable workspace, tab, pane, and agent identifiers before mutating state.
 Prefer agent_prompt, agent_wait, and agent_read for agent conversations. pane_send_text and pane_send_keys are lower-level terminal input and can interleave with an agent's active turn.
 Close, remove, unlink, uninstall, release, and server-stop methods are destructive. Only call them when the user explicitly intends that state change.
-events_subscribe and harness-internal lifecycle reporting are intentionally omitted from this client-facing tool surface.`
+events_subscribe and harness-internal lifecycle reporting are intentionally omitted from this client-facing tool surface.
+
+Saved SSH machines: most tools take an optional machine argument naming one of Herdr's saved machines by label or profile id. Call machine_list to see them; omit machine for the local session. Each machine is an independent Herdr server, so workspace, tab, pane and agent IDs are scoped to it: two machines can both have w1:p1 or an agent named reviewer. Discover IDs on the machine you intend to drive, never reuse a local one there. Connections are made over SSH on first use and a failed remote call never falls back to the local session, so a connection error does not prove a mutation was not applied -- inspect remote state before retrying. Tools that act on the attached client (window title, popup, announcements, live handoff) are local-only and take no machine argument.`
 
 // defaultSlowCallThreshold is the point past which a *successful* call still
 // earns a log line. This server writes no response bytes until the tool
@@ -52,40 +56,142 @@ type Server struct {
 	Logf func(format string, args ...any)
 	// SlowCallThreshold overrides defaultSlowCallThreshold.
 	SlowCallThreshold time.Duration
+	// Machines routes a call carrying a "machine" argument to that saved SSH
+	// machine. Nil disables routing and leaves the tool schemas local-only.
+	Machines MachineRouter
+
+	// mu guards the fields Reload swaps while calls are in flight.
+	mu      sync.Mutex
+	allow   []string
+	deny    []string
+	toolSet map[string]struct{}
+}
+
+// Options configures a bridge. Only Schema, Client and Version are required.
+type Options struct {
+	Schema  *herdr.Schema
+	Client  Caller
+	Version string
+	Allow   []string
+	Deny    []string
+	// Machines, when set, adds a "machine" argument to every routable tool and
+	// dispatches those calls to the named saved SSH machine.
+	Machines MachineRouter
 }
 
 // New registers one MCP tool for every selected method in the Herdr request schema.
-func New(schema *herdr.Schema, client Caller, version string, allow, deny []string) (*Server, error) {
-	methods, err := schema.Methods(allow, deny)
-	if err != nil {
-		return nil, err
-	}
+func New(options Options) (*Server, error) {
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    "herdr-mcp",
 		Title:   "Herdr socket API",
-		Version: version,
+		Version: options.Version,
 	}, &mcp.ServerOptions{Instructions: instructions})
 
 	server := &Server{
-		MCP:     mcpServer,
-		Schema:  schema,
-		Methods: methods,
-		Client:  client,
-		Version: version,
+		MCP:      mcpServer,
+		Client:   options.Client,
+		Version:  options.Version,
+		Machines: options.Machines,
+		allow:    options.Allow,
+		deny:     options.Deny,
+		toolSet:  map[string]struct{}{},
 	}
+	if err := server.register(options.Schema); err != nil {
+		return nil, err
+	}
+	if server.Machines != nil {
+		server.registerMachineList()
+	}
+	return server, nil
+}
+
+// register swaps the tool surface to the one this schema describes. It is the
+// body of both construction and Reload, so a hot reload cannot drift from a
+// cold start.
+func (s *Server) register(schema *herdr.Schema) error {
+	methods, err := schema.Methods(s.allow, s.deny)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fresh := make(map[string]struct{}, len(methods))
 	for _, method := range methods {
 		definition := method
-		mcpServer.AddTool(&mcp.Tool{
+		if s.Machines != nil && routable(definition.Method) {
+			definition.InputSchema = withMachineArgument(definition.InputSchema)
+		}
+		fresh[definition.ToolName] = struct{}{}
+		s.MCP.AddTool(&mcp.Tool{
 			Name:        definition.ToolName,
 			Title:       toolTitle(definition.Method),
 			Description: toolDescription(definition.Method, definition.InputSchema),
 			InputSchema: definition.InputSchema,
 			Annotations: annotations(definition.Method),
 		}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			return server.call(ctx, definition.Method, definition.InputSchema, request.Params.Arguments), nil
+			return s.call(ctx, definition.Method, definition.InputSchema, request.Params.Arguments), nil
 		})
 	}
-	return server, nil
+	// Anything the previous schema had and this one does not must go, or the
+	// bridge keeps advertising a method the running Herdr no longer answers.
+	var removed []string
+	for name := range s.toolSet {
+		if _, kept := fresh[name]; !kept {
+			removed = append(removed, name)
+		}
+	}
+	if len(removed) > 0 {
+		s.MCP.RemoveTools(removed...)
+	}
+	s.toolSet = fresh
+	s.Schema = schema
+	s.Methods = methods
+	return nil
+}
+
+// Reload re-registers the tool surface from a newly read schema and reports
+// what changed.
+//
+// This exists because a protocol number is not a staleness signal: Herdr added
+// a method inside protocol 22, and a bridge that only compares protocols served
+// the old tool list indefinitely while reporting itself healthy. Re-reading the
+// schema and swapping the tools is the fix; the MCP tools/list_changed
+// notification the SDK emits tells connected clients to look again.
+func (s *Server) Reload(schema *herdr.Schema) (added, removed []string, err error) {
+	s.mu.Lock()
+	previous := make(map[string]struct{}, len(s.toolSet))
+	for name := range s.toolSet {
+		previous[name] = struct{}{}
+	}
+	s.mu.Unlock()
+
+	if err := s.register(schema); err != nil {
+		return nil, nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for name := range s.toolSet {
+		if _, existed := previous[name]; !existed {
+			added = append(added, name)
+		}
+	}
+	for name := range previous {
+		if _, kept := s.toolSet[name]; !kept {
+			removed = append(removed, name)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	return added, removed, nil
+}
+
+// ToolCount reports how many tools are registered right now.
+func (s *Server) ToolCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.toolSet)
 }
 
 // HTTPHandler returns the Streamable HTTP transport suitable for /mcp.
@@ -138,21 +244,29 @@ func (s *Server) dispatch(ctx context.Context, method string, input map[string]a
 	if err != nil {
 		return errorResult(method, err)
 	}
+	selector, normalized, err := splitMachine(normalized)
+	if err != nil {
+		return errorResult(method, err, notes...)
+	}
+	caller, err := s.callerFor(ctx, method, selector)
+	if err != nil {
+		return errorResult(method, err, notes...)
+	}
 	if method == "agent.wait" {
-		if err := s.waitThroughLaunch(ctx, normalized); err != nil {
+		if err := s.waitThroughLaunch(ctx, caller, normalized); err != nil {
 			return errorResult(method, err, notes...)
 		}
 	}
-	result, err := s.Client.Call(ctx, method, normalized)
+	result, err := caller.Call(ctx, method, normalized)
 	if err != nil {
 		if strings.HasPrefix(method, "agent.") {
-			err = s.enrichAgentError(ctx, method, normalized, err)
+			err = s.enrichAgentError(ctx, caller, method, normalized, err)
 		}
 		return errorResult(method, err, notes...)
 	}
 	if method == "agent.start" {
 		var readinessNote string
-		result, readinessNote, err = s.waitForStartedAgent(ctx, result, normalized)
+		result, readinessNote, err = s.waitForStartedAgent(ctx, caller, result, normalized)
 		if err != nil {
 			return errorResult(method, err, notes...)
 		}

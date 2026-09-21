@@ -1,8 +1,8 @@
 id = "ocai.herdr-mcp"
 name = "Herdr MCP"
-version = "0.2.6"
+version = "0.4.0"
 min_herdr_version = "0.8.0"
-description = "Expose the active Herdr socket API as MCP tools"
+description = "Expose the Herdr socket API as MCP tools, locally and on saved SSH machines"
 platforms = ["linux", "macos"]
 
 [[build]]

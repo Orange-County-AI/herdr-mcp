@@ -88,4 +88,13 @@ var curatedToolDescriptions = map[string]string{
 	"notification.show":             "Show a desktop notification in the active Herdr session.",
 	"server.agent_manifests":        "List installed agent-detection manifests and the harness kinds that agent_start can launch.",
 	"server.reload_agent_manifests": "Reload agent-detection manifests after changing their configuration.",
+	"pane.link.resolve":             "Resolve a link at a position in a terminal pane without opening it, reporting the target it would activate.",
+	"pane.link.activate":            "Open the link at a position in a terminal pane, as a click would.",
+	"workspace.list":                "List workspaces with stable workspace IDs, labels, and tab and pane counts. IDs are scoped to one machine.",
+	"tab.list":                      "List tabs with stable tab IDs and their workspace. IDs are scoped to one machine.",
+	"worktree.list":                 "List Git worktree workspaces with their branch, path, and workspace ID.",
+	"command.invoke":                "Invoke a Herdr command by name, the same action a keybinding would trigger.",
+	"plugin.list":                   "List installed Herdr plugins, their ids, and whether each is enabled.",
+	"plugin.action.list":            "List the actions installed plugins expose, by plugin id.",
+	"plugin.action.invoke":          "Invoke one plugin action by its fully qualified action id.",
 }

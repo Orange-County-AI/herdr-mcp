@@ -11,6 +11,73 @@ At startup it:
 
 The tool surface follows the socket method names: `agent.read` becomes `agent_read`, `pane.wait_for_output` becomes `pane_wait_for_output`, and so on. Results are returned as both MCP structured content and JSON text.
 
+It re-reads that schema on an interval and swaps the tools when it changed, and
+most tools take an optional `machine` argument that runs them on one of Herdr's
+saved SSH machines. See [Saved SSH machines](#saved-ssh-machines) and
+[Keeping up with Herdr](#keeping-up-with-herdr).
+
+## Saved SSH machines
+
+Herdr 0.9 made remote machines first class: `herdr machine add` saves an SSH
+profile, and each one is an **independent Herdr server** with its own state.
+Most tools here take an optional `machine` argument naming one by label or
+profile id, so the same 93 methods drive any saved machine:
+
+```jsonc
+{"name": "pane_list",  "arguments": {}}                        // this machine
+{"name": "pane_list",  "arguments": {"machine": "minime"}}     // the saved "minime"
+{"name": "agent_prompt", "arguments": {"machine": "gigachad", "target": "reviewer",
+                                       "text": "Summarize the failing test."}}
+```
+
+Call `machine_list` to see the saved profiles and which ones the bridge is
+currently connected to. It is the one tool that is not a Herdr socket method:
+machine profiles are client-side configuration and the socket protocol has no
+`machine.*` method and no routing field in its request envelope.
+
+**IDs are scoped to one machine.** Two machines can both have `w1:p1`, or an
+agent named `reviewer`. A pane id discovered locally never addresses a remote
+pane. List on the machine you intend to drive.
+
+**How it connects.** On first use the bridge asks that host for its Herdr socket
+path (`herdr status server --json` over SSH -- the path is not assumable, it is
+`~/.config/herdr/herdr.sock` on a normal host and `/dev/shm/herdr/herdr.sock` on
+an agent box), then forwards that socket to a local one over an SSH control
+master and talks to it exactly as it talks to the local session. That is why
+every method works remotely and not just the subset Herdr's own
+`herdr --machine` CLI covers. Connections are made lazily, verified to speak the
+same protocol the tools were registered from, and dropped after `--machine-idle`
+without use. The system `ssh` binary does the work, so `~/.ssh/config`
+(ProxyJump, IdentityFile, agent, Tailscale aliases) applies unchanged.
+
+**Requirements and limits.** Herdr 0.9+ on both ends, with the remote server
+already running -- forwarding never starts one. A failed remote call never falls
+back to the local session, and a connection error does **not** prove a mutation
+was not applied: inspect remote state before retrying. Tools that act on the
+attached client (`client_window_title_*`, `client_shell_surface_set`,
+`popup_close`, the dismiss tools, `server_live_handoff`) are local-only and
+carry no `machine` argument, because there is no attached client on the far end.
+
+Pass `--machines=false` to drop routing entirely, leaving a local-only bridge.
+
+## Keeping up with Herdr
+
+Herdr updates itself, and a bridge whose tools only change on restart is
+quietly wrong in between. **The protocol number is not a sufficient staleness
+signal**: Herdr 0.9.1 added `pane.link.resolve` inside protocol 22, so a bridge
+started against 0.9.0 kept reporting a matching protocol while serving one tool
+fewer than the running Herdr had.
+
+So the bridge digests the schema document, re-reads it every
+`--schema-refresh` (default 5m), and when the digest moves it re-registers the
+tool surface in place and emits the MCP `tools/list_changed` notification.
+Removed methods are unregistered, added ones appear, the expected protocol is
+re-pointed, and every forwarded machine connection is dropped so the next call
+re-verifies the far end against the new protocol. `/healthz` and `doctor` both
+report `schema_digest` so a stale bridge is visible rather than inferred.
+
+Set `--schema-refresh 0` to disable it and go back to restart-only updates.
+
 ## Herdr plugin
 
 **Recommended.** Let Herdr own the checkout and build instead of placing a
@@ -202,19 +269,27 @@ queue during an outage only guarantees that everyone waits and then fails.
 **Health.** `GET /healthz` reports the bridge, with Herdr nested underneath:
 
 ```json
-{"ok": true, "protocol": 20, "tools": 84,
+{"ok": true, "protocol": 22, "tools": 94, "schema_digest": "sha256:226d4ecb...",
  "herdr": {"available": false, "down_for_seconds": 12, "waiting": 3, "in_flight": 8,
-           "detail": "Herdr socket unreachable; calls are parked until it returns"}}
+           "detail": "Herdr socket unreachable; calls are parked until it returns"},
+ "machines": [{"id": "0fb972d6...", "label": "minime", "target": "minime",
+               "enabled": true, "connected": true, "herdr_version": "0.9.1",
+               "protocol": 22, "idle_for_seconds": 41}]}
 ```
+
+`machines` lists every saved profile and marks the ones this bridge holds a
+connection to. Reporting never dials, so polling `/healthz` cannot cost an SSH
+handshake to a sleeping laptop.
 
 `ok` now means the MCP endpoint is serving tools, which stopped being the same
 fact as "Herdr is up" the moment the bridge was allowed to outlive an outage.
 **A monitor that alerted on Herdr being down must watch `herdr.available`.**
 `ok` goes false, with HTTP 503, only when the bridge itself cannot serve
 correctly -- today that means Herdr came back on a different protocol than the
-one its registered tools were built from. Calls then return that mismatch with
-the fix (restart `herdr-mcp`) rather than sending well-formed requests with the
-wrong meaning. `doctor` is unchanged and still strict: it fails if the binary,
+one its registered tools were built from. Calls then return that mismatch rather
+than sending well-formed requests with the wrong meaning. The next schema
+refresh normally clears it on its own by re-registering the tools; restarting
+`herdr-mcp` forces it immediately. `doctor` is unchanged and still strict: it fails if the binary,
 the socket, or the protocols disagree.
 
 ## Method policy
@@ -263,6 +338,9 @@ Common configuration:
 | `--max-long-concurrent` | `HERDR_MCP_MAX_LONG_CONCURRENT` | `64` |
 | `--queue-depth` | `HERDR_MCP_QUEUE_DEPTH` | `256` |
 | `--outage-grace` | `HERDR_MCP_OUTAGE_GRACE` | `2m` |
+| `--machines` | `HERDR_MCP_MACHINES` | `true` |
+| `--machine-idle` | `HERDR_MCP_MACHINE_IDLE` | `15m` |
+| `--schema-refresh` | `HERDR_MCP_SCHEMA_REFRESH` | `5m` |
 
 `serve` refuses non-loopback listeners. Remote access belongs behind a tunnel and an authorization policy, not on a public origin port.
 

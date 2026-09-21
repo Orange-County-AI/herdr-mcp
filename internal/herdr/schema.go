@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -16,6 +17,16 @@ type Schema struct {
 	Protocol      int                        `json:"protocol"`
 	SchemaVersion int                        `json:"schema_version"`
 	Schemas       map[string]json.RawMessage `json:"schemas"`
+
+	// Digest is the sha256 of the document this schema was parsed from.
+	//
+	// The protocol number is not a sufficient staleness signal, which cost us a
+	// stale tool surface in production: Herdr 0.9.1 added pane.link.resolve
+	// INSIDE protocol 22, so a bridge registered from the 0.9.0 schema kept
+	// reporting a matching protocol while serving one tool fewer than the
+	// running Herdr had. Comparing digests catches a method set that moved
+	// without the number moving.
+	Digest string `json:"-"`
 }
 
 // MethodDefinition describes one non-streaming Herdr socket method as an MCP tool.
@@ -52,6 +63,7 @@ func ParseSchema(data []byte) (*Schema, error) {
 	if err := json.Unmarshal(data, &schema); err != nil {
 		return nil, fmt.Errorf("decode Herdr API schema: %w", err)
 	}
+	schema.Digest = fmt.Sprintf("sha256:%x", sha256.Sum256(data))
 	if schema.Protocol <= 0 {
 		return nil, fmt.Errorf("Herdr API schema has invalid protocol %d", schema.Protocol)
 	}

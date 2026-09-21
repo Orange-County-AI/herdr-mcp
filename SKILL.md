@@ -157,11 +157,59 @@ stops. Do not read a failed `herdr-mcp` start as "Herdr is down" any more.
   `herdr.available`, `herdr.down_for_seconds`, `herdr.waiting`, and
   `herdr.in_flight`. `ok:false` with HTTP 503 means the bridge itself cannot
   serve correctly -- currently only a Herdr protocol that no longer matches its
-  registered tools, fixed by restarting `herdr-mcp`.
+  registered tools. The next schema refresh usually clears it by re-registering
+  the tools; restarting `herdr-mcp` forces it immediately.
 
 `doctor` is unchanged and stays strict: it fails when the binary is missing, the
 socket is unreachable, or the protocols disagree. Use it, not `/healthz`, to
 answer "is Herdr actually reachable right now".
+
+## Drive a saved SSH machine
+
+Herdr 0.9 made saved SSH machines first class, and most tools take an optional
+`machine` argument naming one by label or profile id. Omit it for the local
+session.
+
+```jsonc
+{"name": "machine_list", "arguments": {}}
+{"name": "pane_list",    "arguments": {"machine": "minime"}}
+{"name": "agent_prompt", "arguments": {"machine": "gigachad", "target": "reviewer",
+                                       "text": "Summarize the failing test."}}
+```
+
+- **`machine_list` is the only discovery path.** Machine profiles are Herdr
+  client configuration; the socket protocol has no `machine.*` method. The
+  result also shows which machines the bridge currently holds a connection to.
+- **IDs are scoped to one machine.** Two machines can both have `w1:p1` or an
+  agent named `reviewer`. Never reuse a locally discovered id remotely: list on
+  the machine you intend to drive. Labels are case-sensitive.
+- **The far end must already be running Herdr 0.9+.** The bridge probes the
+  host for its socket path, forwards that socket over SSH, and refuses a machine
+  whose protocol differs from the one its tools were registered from. It never
+  starts a remote server.
+- **A failed remote call never falls back to local**, and a connection error
+  does not prove a mutation was not applied. Inspect remote state before
+  retrying anything that mutates.
+- **Client-scoped tools are local-only** (`client_window_title_*`,
+  `client_shell_surface_set`, `popup_close`, the dismiss tools,
+  `server_live_handoff`) and reject a `machine` argument, because there is no
+  attached client on the far end.
+
+Connections are lazy, reuse one SSH control master per machine, and are dropped
+after `--machine-idle` (default `15m`). `--machines=false` disables routing.
+
+## Expect the tool list to change under you
+
+The bridge re-reads Herdr's schema every `--schema-refresh` (default `5m`) and
+re-registers its tools when the document changed, emitting the MCP
+`tools/list_changed` notification. Re-list tools when you see it rather than
+caching the surface for the life of a session.
+
+This exists because the protocol number is not a staleness signal: Herdr 0.9.1
+added `pane.link.resolve` inside protocol 22, so a bridge started against 0.9.0
+reported a matching protocol while serving a tool list that was one short.
+`/healthz` and `doctor` both report `schema_digest`, which is what actually
+moves.
 
 ## Treat the tool surface as privileged
 
@@ -172,7 +220,7 @@ Before exposing a server to another user or agent, decide whether it needs the f
 ## Diagnose failures
 
 - **Socket connection failure:** confirm Herdr is running and inspect `HERDR_SOCKET_PATH`. Tool calls report this only after `--outage-grace` elapses; `herdr-mcp doctor` and `/healthz`'s `herdr.available` answer immediately.
-- **Protocol mismatch:** ensure `HERDR_BIN` and the running Herdr server are the same release, then rerun `doctor`. If Herdr changed protocol while the bridge was running, every call reports it and `/healthz` returns 503 until `herdr-mcp` restarts and re-reads the schema.
+- **Protocol mismatch:** ensure `HERDR_BIN` and the running Herdr server are the same release, then rerun `doctor`. If Herdr changed protocol while the bridge was running, every call reports it and `/healthz` returns 503 until the next `--schema-refresh` re-registers the tools, or until `herdr-mcp` restarts.
 - **Calls fail with "queue is saturated":** more than `--queue-depth` calls are already waiting per lane. Check `/healthz` `herdr.waiting`; if Herdr is up, raise `--max-concurrent`, and if it is down, fix that first.
 - **Tools are registered but stale:** the log says `using cached Herdr schema`. The `herdr` binary named by `--herdr-bin` could not answer; restart the service once it can.
 - **Service starts in a shell but not systemd:** inspect the unit's resolved `--herdr-bin` and the environment file; do not rely on shell-only PATH setup.
@@ -180,3 +228,8 @@ Before exposing a server to another user or agent, decide whether it needs the f
 - **Origin returns `missing Cloudflare Access assertion`:** verify the request traversed the Access application and that its audience matches `CF_ACCESS_AUD`.
 - **Tool is absent:** inspect `HERDR_MCP_ALLOW_METHODS` and `HERDR_MCP_DENY_METHODS`, then restart the service.
 - **`events_subscribe` is absent:** this is intentional; use a one-shot wait tool.
+- **A `machine` argument is rejected as "not accepted":** either the tool is client-scoped and local-only, or the bridge runs with `--machines=false`. Check `machine_list`; if it is missing too, routing is off.
+- **`no saved Herdr machine matches ...`:** the error lists the known labels. They are case-sensitive, and a disabled profile is reported as disabled rather than missing. `herdr machine list --json` is the source of truth.
+- **`Herdr is not running on <host>`:** start Herdr there; forwarding never starts a remote server. `ssh <host> herdr status server --json` reproduces the probe.
+- **A remote machine is refused on protocol:** the two Herdr installs are different releases. Update both, then let the bridge reload or restart it.
+- **A remote call fails to connect:** it was **not** rolled back for you. Inspect remote state with a list tool before retrying a mutation.

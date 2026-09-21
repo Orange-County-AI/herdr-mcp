@@ -240,3 +240,11 @@ func numberAsInt64(value any) (int64, bool) {
 		return 0, false
 	}
 }
+
+// Transport is anything that can carry one socket call: the local Client, the
+// Queue wrapping it, or a Remote's queue on the far end of an SSH forward.
+// Tool dispatch is written against this so local and remote calls share a
+// single code path.
+type Transport interface {
+	Call(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error)
+}

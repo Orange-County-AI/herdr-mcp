@@ -19,9 +19,10 @@ func TestWaitForStartedAgentReturnsInteractiveAgent(t *testing.T) {
 		}
 		return `{"type":"agent_info","agent":{"name":"reviewer","pane_id":"w1:p2","interactive_ready":true}}`
 	})
-	server := &Server{Client: &herdr.Client{SocketPath: socket}}
+	client := &herdr.Client{SocketPath: socket}
+	server := &Server{Client: client}
 	started := json.RawMessage(`{"type":"agent_started","agent":{"name":"reviewer","launch_pending":true}}`)
-	result, note, err := server.waitForStartedAgent(context.Background(), started, json.RawMessage(`{"name":"reviewer"}`))
+	result, note, err := server.waitForStartedAgent(context.Background(), client, started, json.RawMessage(`{"name":"reviewer"}`))
 	if err != nil || note != "" {
 		t.Fatalf("result = %s, note = %q, err = %v", result, note, err)
 	}
@@ -44,8 +45,9 @@ func TestWaitThroughLaunchWaitsBeforeAgentWait(t *testing.T) {
 			return ""
 		}
 	})
-	server := &Server{Client: &herdr.Client{SocketPath: socket}}
-	if err := server.waitThroughLaunch(context.Background(), json.RawMessage(`{"target":"reviewer","timeout_ms":1000}`)); err != nil {
+	client := &herdr.Client{SocketPath: socket}
+	server := &Server{Client: client}
+	if err := server.waitThroughLaunch(context.Background(), client, json.RawMessage(`{"target":"reviewer","timeout_ms":1000}`)); err != nil {
 		t.Fatal(err)
 	}
 	if got := <-methods; got != "agent.list" {

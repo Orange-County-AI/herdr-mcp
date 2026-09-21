@@ -255,6 +255,12 @@ func unitBody(result Result, herdrBinary, listen string) string {
 	// the schema cache unwritable, and without that cache the bridge cannot
 	// register tools during an upgrade that replaces the Herdr binary -- which
 	// is one of the outages it exists to cover.
+	//
+	// RuntimeDirectory holds the forwarded sockets for saved SSH machines, and
+	// systemd removes it on stop, so a crash cannot leave stale sockets that
+	// block the next ssh from binding. ProtectHome stays read-only: ssh needs to
+	// READ ~/.ssh, and a host it has never seen simply fails to be recorded in
+	// known_hosts rather than failing to connect.
 	return fmt.Sprintf(`[Unit]
 Description=Herdr socket API MCP bridge
 After=network-online.target herdr.service
@@ -267,6 +273,7 @@ ExecStart=%s serve --listen %s --herdr-bin %s
 Restart=always
 RestartSec=3
 CacheDirectory=herdr-mcp
+RuntimeDirectory=herdr-mcp
 ProtectSystem=strict
 ProtectHome=read-only
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
