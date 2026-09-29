@@ -294,7 +294,7 @@ the socket, or the protocols disagree.
 
 ## Method policy
 
-By default every non-streaming client-facing method in the selected Herdr schema is exposed. `events.subscribe` is omitted because a one-shot MCP tool call cannot preserve that streaming socket lifetime; use `events_wait` or `pane_wait_for_output` instead. Harness-internal lifecycle reporting (`pane.report_*`, `pane.release_agent`, and `pane.clear_agent_authority`) and terminal graphics (`pane.graphics.*`) are also omitted to keep client tool discovery focused on agent and pane control.
+By default every non-streaming client-facing method in the selected Herdr schema is exposed. `events.subscribe` is omitted because a one-shot MCP tool call cannot preserve that streaming socket lifetime; use `events_wait` or `pane_wait_for_output` instead. Harness-internal lifecycle reporting (`pane.report_*`, `pane.release_agent`, and `pane.clear_agent_authority`) and terminal graphics (`pane.graphics.*`, removed outright in Herdr 0.9.2) are also omitted to keep client tool discovery focused on agent and pane control. `server.ssh_agent.register` (Herdr 0.9.2) is omitted for the same reason as `events.subscribe`: a registration lasts only as long as the API connection that made it, and the bridge dials a fresh connection per call, so the tool could only register and immediately unregister.
 
 To re-expose the internal methods for a specialized client while keeping the unsupported subscription excluded, pass `--deny-methods 'events.subscribe'`.
 The full surface includes destructive operations such as `server_stop`, `worktree_remove`, `pane_close`, plugin unlinking, and integration uninstalling. Restrict a deployment with exact names or shell-style globs:
@@ -309,7 +309,7 @@ Equivalent environment variables:
 
 ```dotenv
 HERDR_MCP_ALLOW_METHODS=ping,session.snapshot,agent.*,pane.read,pane.wait_for_output
-HERDR_MCP_DENY_METHODS=events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*
+HERDR_MCP_DENY_METHODS=events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*,server.ssh_agent.register
 
 An allow list is evaluated first; the deny list always wins.
 

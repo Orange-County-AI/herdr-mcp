@@ -105,7 +105,7 @@ The service reads the optional file `~/.config/herdr-mcp/env`. Do not overwrite 
 ```dotenv
 HERDR_SOCKET_PATH=/home/you/.config/herdr/herdr.sock
 HERDR_MCP_ALLOW_METHODS=ping,session.snapshot,agent.*,pane.read,pane.wait_for_output
-HERDR_MCP_DENY_METHODS=events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*
+HERDR_MCP_DENY_METHODS=events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*,server.ssh_agent.register
 CF_ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 CF_ACCESS_AUD=your-access-application-audience
 ```
@@ -117,7 +117,7 @@ systemctl --user restart herdr-mcp.service
 curl --fail http://127.0.0.1:8091/healthz
 ```
 
-An allow list is evaluated first; the deny list always wins. By default, `events.subscribe`, harness-internal lifecycle reporting, and `pane.graphics.*` are hidden so client discovery focuses on agent and pane control. Use `events_wait` or `pane_wait_for_output` instead of the unsupported persistent subscription. Pass `--deny-methods 'events.subscribe'` only when a specialized client genuinely needs the internal protocol methods.
+An allow list is evaluated first; the deny list always wins. By default, `events.subscribe`, harness-internal lifecycle reporting, `pane.graphics.*` and the connection-scoped `server.ssh_agent.register` are hidden so client discovery focuses on agent and pane control. Use `events_wait` or `pane_wait_for_output` instead of the unsupported persistent subscription. Pass `--deny-methods 'events.subscribe'` only when a specialized client genuinely needs the internal protocol methods.
 
 ## Expose it through Cloudflare
 

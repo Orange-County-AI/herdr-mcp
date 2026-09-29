@@ -29,7 +29,7 @@ const version = "0.4.0"
 // before falling back to the cached schema.
 const schemaLoadBudget = 20 * time.Second
 
-const defaultDenyMethods = "events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*"
+const defaultDenyMethods = "events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*,server.ssh_agent.register"
 
 type commonFlags struct {
 	socket          string
