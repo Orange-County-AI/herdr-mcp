@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Orange-County-AI/herdr-mcp/internal/access"
 	"github.com/Orange-County-AI/herdr-mcp/internal/herdr"
+	"github.com/Orange-County-AI/herdr-mcp/internal/httptransport"
 	"github.com/Orange-County-AI/herdr-mcp/internal/mcpserver"
 	"github.com/Orange-County-AI/herdr-mcp/internal/service"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -98,18 +98,20 @@ func runServe(arguments []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	common := addCommonFlags(flags)
-	listen := flags.String("listen", envDefault("HERDR_MCP_LISTEN", "127.0.0.1:8091"), "loopback address for Streamable HTTP")
-	accessTeam := flags.String("access-team-domain", os.Getenv("CF_ACCESS_TEAM_DOMAIN"), "Cloudflare Access team domain")
-	accessAudience := flags.String("access-aud", os.Getenv("CF_ACCESS_AUD"), "Cloudflare Access application audience")
+	httpConfig, allowedHosts := addHTTPFlags(flags, "127.0.0.1:8091")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("serve does not accept positional arguments")
 	}
-	if err := validateListen(*listen); err != nil {
+	markHTTPFlags(flags, httpConfig)
+	httpConfig.AllowedHosts = splitCSV(*allowedHosts)
+	transport, err := httptransport.New(*httpConfig)
+	if err != nil {
 		return err
 	}
+	log.Printf("auth: %s", transport.AuthMode())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -121,25 +123,22 @@ func runServe(arguments []string) error {
 		log.Printf("startup: %s", note)
 	}
 
-	var mcpHandler http.Handler = bundle.Server.HTTPHandler()
-	if *accessTeam != "" || *accessAudience != "" {
-		validator, err := access.NewValidator(*accessTeam, *accessAudience)
-		if err != nil {
-			return err
-		}
-		mcpHandler = validator.Middleware(mcpHandler)
-		log.Printf("auth: Cloudflare Access JWT required for /mcp")
-	} else {
-		log.Printf("auth: /mcp trusts the network edge; keep the listener on loopback and require Cloudflare Access externally")
-	}
-
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", mcpHandler)
+	mux.Handle("/mcp", bundle.Server.HTTPHandler())
 	mux.HandleFunc("/healthz", healthHandler(bundle))
 
+	minimalHealth := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		status := bundle.Queue.Availability()
+		if status.ProtocolMismatch {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": !status.ProtocolMismatch})
+	})
+
 	httpServer := &http.Server{
-		Addr:              *listen,
-		Handler:           mux,
+		Addr:              httpConfig.Listen,
+		Handler:           transport.Guard(mux, minimalHealth),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -161,8 +160,12 @@ func runServe(arguments []string) error {
 	log.Printf("queue: %d concurrent, %d long-poll, %d queued per lane, %s outage grace",
 		common.concurrency, common.longConcurrency, common.queueDepth, common.outageGrace)
 	log.Printf("machines: %s", describeMachineRouting(ctx, bundle, *common))
-	log.Printf("mcp: %d tools at http://%s/mcp", bundle.Server.ToolCount(), *listen)
-	err = httpServer.ListenAndServe()
+	log.Printf("mcp: %d tools at %s://%s/mcp", bundle.Server.ToolCount(), transport.Scheme(), httpConfig.Listen)
+	listener, err := net.Listen("tcp", httpConfig.Listen)
+	if err != nil {
+		return err
+	}
+	err = transport.Serve(httpServer, listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		<-shutdownDone
 		return nil
@@ -235,7 +238,7 @@ func runDoctor(arguments []string) error {
 func runInstallService(arguments []string) error {
 	flags := flag.NewFlagSet("install-service", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	listen := flags.String("listen", os.Getenv("HERDR_MCP_LISTEN"), "loopback address for the installed service (default: existing service environment or 127.0.0.1:8091)")
+	httpConfig, allowedHosts := addHTTPFlags(flags, "", false)
 	timeout := flags.Duration("timeout", 15*time.Second, "maximum time to wait for service health")
 	if err := flags.Parse(arguments); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -256,8 +259,12 @@ func runInstallService(arguments []string) error {
 	if err != nil {
 		return err
 	}
+	markHTTPFlags(flags, httpConfig)
 	result, err := installer.Install(ctx, service.Options{
-		Listen:        *listen,
+		Listen:        httpConfig.Listen,
+		HTTP:          *httpConfig,
+		AllowedHosts:  *allowedHosts,
+		HTTPFlags:     httpConfig.Explicit,
 		HealthTimeout: *timeout,
 	})
 	if err != nil {
@@ -560,21 +567,6 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
-func validateListen(address string) error {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return fmt.Errorf("invalid --listen address %q: %w", address, err)
-	}
-	if host == "localhost" {
-		return nil
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("--listen must use a loopback address; expose it through Cloudflare Tunnel instead")
-	}
-	return nil
-}
-
 func splitCSV(value string) []string {
 	var values []string
 	for _, item := range strings.Split(value, ",") {
@@ -596,7 +588,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, `herdr-mcp exposes Herdr's socket API as MCP tools.
 
 usage:
-  herdr-mcp serve [flags]            serve Streamable HTTP on loopback (default)
+  herdr-mcp serve [flags]            serve Streamable HTTP/HTTPS (loopback by default)
   herdr-mcp stdio [flags]            serve MCP over stdin/stdout
   herdr-mcp doctor [flags]           verify schema/socket compatibility
   herdr-mcp install-service [flags]  install and start a systemd user service
@@ -606,4 +598,34 @@ Tools take an optional "machine" argument naming a saved Herdr SSH machine
 (see machine_list); omit it for the local session.
 
 Run "herdr-mcp <command> -h" for command flags.`)
+}
+
+// Only source paths are flags. The credential itself is never accepted on argv.
+func addHTTPFlags(flags *flag.FlagSet, defaultListen string, useEnvironment ...bool) (*httptransport.Config, *string) {
+	c := &httptransport.Config{}
+	getenv := os.Getenv
+	defaultEnv := envDefault
+	allowPrivate := envBool("HERDR_MCP_ALLOW_PRIVATE", false)
+	if len(useEnvironment) > 0 && !useEnvironment[0] {
+		getenv = func(string) string { return "" }
+		defaultEnv = func(_ string, fallback string) string { return fallback }
+		allowPrivate = false
+	}
+	flags.StringVar(&c.Listen, "listen", defaultEnv("HERDR_MCP_LISTEN", defaultListen), "loopback address, or explicitly opted-in private IP")
+	flags.BoolVar(&c.RequireAuth, "require-auth", false, "refuse startup without configured authentication (generated service guard)")
+	flags.BoolVar(&c.AllowPrivate, "allow-private", allowPrivate, "allow a private IP listener (requires bearer auth and native TLS)")
+	flags.StringVar(&c.BearerTokenFile, "bearer-token-file", getenv("HERDR_MCP_BEARER_TOKEN_FILE"), "owner-only bearer secret file; alternatively set HERDR_MCP_BEARER_TOKEN")
+	flags.StringVar(&c.TLSCertFile, "tls-cert-file", getenv("HERDR_MCP_TLS_CERT_FILE"), "PEM server certificate chain file")
+	flags.StringVar(&c.TLSKeyFile, "tls-key-file", getenv("HERDR_MCP_TLS_KEY_FILE"), "PEM server private-key file")
+	flags.StringVar(&c.AccessTeam, "access-team-domain", getenv("CF_ACCESS_TEAM_DOMAIN"), "Cloudflare Access team domain (exclusive with bearer)")
+	flags.StringVar(&c.AccessAudience, "access-aud", getenv("CF_ACCESS_AUD"), "Cloudflare Access application audience")
+	hosts := flags.String("allowed-hosts", getenv("HERDR_MCP_ALLOWED_HOSTS"), "comma-separated additional exact Host authorities, including port if used")
+	return c, hosts
+}
+
+func markHTTPFlags(flags *flag.FlagSet, c *httptransport.Config) {
+	c.Explicit = make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { c.Explicit[f.Name] = true })
+	c.BearerFileSet = c.Explicit["bearer-token-file"]
+	c.TLSSet = c.Explicit["tls-cert-file"] || c.Explicit["tls-key-file"]
 }

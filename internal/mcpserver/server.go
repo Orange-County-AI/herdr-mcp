@@ -197,8 +197,8 @@ func (s *Server) ToolCount() int {
 // HTTPHandler returns the Streamable HTTP transport suitable for /mcp.
 func (s *Server) HTTPHandler() http.Handler {
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.MCP }, &mcp.StreamableHTTPOptions{
-		// The HTTP listener is loopback-only and normally reached through a
-		// Cloudflare Tunnel, whose public Host header is expected.
+		// The outer httptransport guard authenticates every request and checks
+		// Host/Origin, including an explicitly allowed Cloudflare hostname.
 		DisableLocalhostProtection: true,
 	})
 }
