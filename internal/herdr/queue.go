@@ -68,6 +68,9 @@ type Queue struct {
 	OutageGrace time.Duration
 	// Logf receives outage transitions. Nil uses log.Printf.
 	Logf func(format string, args ...any)
+	// VerifyProtocol checks a routed socket before delivering each request,
+	// including after an outage. A restarted session may speak a new protocol.
+	VerifyProtocol bool
 
 	initOnce sync.Once
 	short    *lane
@@ -135,8 +138,19 @@ func (q *Queue) init() {
 // Call runs one Herdr method through admission control, waiting out an outage
 // where it can. It satisfies the same contract as Client.Call.
 func (q *Queue) Call(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	return q.call(ctx, method, params, q.VerifyProtocol)
+}
+
+// CallVerified uses this queue's admission control and checks the socket
+// protocol before delivery. A routed alias of the startup socket uses this
+// without changing the verification behavior of calls with no selector.
+func (q *Queue) CallVerified(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	return q.call(ctx, method, params, true)
+}
+
+func (q *Queue) call(ctx context.Context, method string, params json.RawMessage, verify bool) (json.RawMessage, error) {
 	q.init()
-	if q.mismatch.Load() {
+	if q.mismatch.Load() && !verify {
 		return nil, fmt.Errorf("herdr-mcp built its tools from protocol %d but the running Herdr reports protocol %d; restart herdr-mcp so it re-reads the schema",
 			q.expectProtocol.Load(), q.lastProtocol.Load())
 	}
@@ -153,10 +167,10 @@ func (q *Queue) Call(ctx context.Context, method string, params json.RawMessage)
 	}
 	defer lane.release()
 
-	return q.callWaitingOutOutage(ctx, method, params)
+	return q.callWaitingOutOutage(ctx, method, params, verify)
 }
 
-func (q *Queue) callWaitingOutOutage(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+func (q *Queue) callWaitingOutOutage(ctx context.Context, method string, params json.RawMessage, verify bool) (json.RawMessage, error) {
 	grace := q.OutageGrace
 	if grace == 0 {
 		grace = defaultOutageGrace
@@ -164,7 +178,7 @@ func (q *Queue) callWaitingOutOutage(ctx context.Context, method string, params 
 	deadline := time.Now().Add(grace)
 
 	for {
-		result, err := q.Client.Call(ctx, method, params)
+		result, err := q.callVerified(ctx, method, params, verify)
 		if err == nil {
 			q.markUp(0)
 			return result, nil
@@ -184,6 +198,25 @@ func (q *Queue) callWaitingOutOutage(ctx context.Context, method string, params 
 			return nil, q.outageError(method, err)
 		}
 	}
+}
+
+func (q *Queue) callVerified(ctx context.Context, method string, params json.RawMessage, verify bool) (json.RawMessage, error) {
+	if err := q.stop.Err(); err != nil {
+		return nil, err
+	}
+	if verify {
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		_, protocol, err := q.Client.Ping(probeCtx)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("verify routed Herdr socket: %w", err)
+		}
+		q.markUp(protocol)
+	}
+	if q.mismatch.Load() {
+		return nil, fmt.Errorf("protocol mismatch: registered tools use protocol %d but this session reports protocol %d", q.expectProtocol.Load(), q.lastProtocol.Load())
+	}
+	return q.Client.Call(ctx, method, params)
 }
 
 func (q *Queue) outageError(method string, cause error) error {

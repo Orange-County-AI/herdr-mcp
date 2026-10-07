@@ -32,37 +32,44 @@ type Pool struct {
 	// Tune is applied to each machine's queue, so a remote gets the same
 	// admission control as the local session.
 	Tune func(*Queue)
+	// StartupQueue is shared when an explicit local selector names the bridge's
+	// own socket. Aliases must not multiply that session's admission budget.
+	StartupQueue *Queue
 	// Logf receives connection lifecycle lines. Nil uses log.Printf.
 	Logf func(format string, args ...any)
 
-	stop context.Context
+	stop          context.Context
+	sessionProbes chan struct{}
 
-	mu       sync.Mutex
-	remotes  map[string]*Remote
-	dialing  map[string]chan struct{}
-	machines []Machine
-	listedAt time.Time
-	reaping  bool
+	mu         sync.Mutex
+	remotes    map[string]*Remote
+	locals     map[string]*localConnection
+	dialing    map[string]chan struct{}
+	generation uint64
+	machines   []Machine
+	sessions   []Session
+	listedAt   time.Time
+	reaping    bool
 }
 
 const (
 	defaultIdleTimeout = 15 * time.Minute
-	// machineListTTL keeps `herdr machine list` off the hot path without making
-	// a newly added machine invisible for long.
-	machineListTTL = 30 * time.Second
-	reapInterval   = time.Minute
+	machineListTTL     = 30 * time.Second
+	reapInterval       = time.Minute
 )
 
 // NewPool builds a pool bound to stop, which tears every connection down when
 // cancelled.
 func NewPool(stop context.Context, binary string, protocol int, runtimeDir string) *Pool {
 	return &Pool{
-		Binary:     binary,
-		Protocol:   protocol,
-		RuntimeDir: runtimeDir,
-		stop:       stop,
-		remotes:    map[string]*Remote{},
-		dialing:    map[string]chan struct{}{},
+		Binary:        binary,
+		Protocol:      protocol,
+		RuntimeDir:    runtimeDir,
+		stop:          stop,
+		sessionProbes: make(chan struct{}, 4),
+		remotes:       map[string]*Remote{},
+		locals:        map[string]*localConnection{},
+		dialing:       map[string]chan struct{}{},
 	}
 }
 
@@ -81,7 +88,8 @@ func DefaultRuntimeDir() (string, error) {
 	return dir, nil
 }
 
-// Machines returns the saved profiles, cached briefly.
+// Machines returns saved profiles for health reporting. During a binary
+// upgrade it can report the previous list; dispatch always requires a fresh one.
 func (p *Pool) Machines(ctx context.Context) ([]Machine, error) {
 	p.mu.Lock()
 	if time.Since(p.listedAt) < machineListTTL && p.machines != nil {
@@ -90,7 +98,8 @@ func (p *Pool) Machines(ctx context.Context) ([]Machine, error) {
 		return machines, nil
 	}
 	p.mu.Unlock()
-
+	ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
+	defer cancel()
 	machines, err := ListMachines(ctx, p.Binary)
 	if err != nil {
 		// A stale list beats no list: `herdr machine list` needs the binary, and
@@ -114,15 +123,7 @@ func (p *Pool) Machines(ctx context.Context) ([]Machine, error) {
 // Caller resolves a machine selector to its transport, connecting on first use.
 // An empty selector is the caller's local session and is not this pool's job.
 func (p *Pool) Caller(ctx context.Context, selector string) (Transport, error) {
-	machines, err := p.Machines(ctx)
-	if err != nil {
-		return nil, err
-	}
-	machine, err := SelectMachine(machines, selector)
-	if err != nil {
-		return nil, err
-	}
-	return p.connect(ctx, machine)
+	return p.route(ctx, selector)
 }
 
 // connect returns the live connection for machine, dialling it if needed. Only
@@ -130,15 +131,16 @@ func (p *Pool) Caller(ctx context.Context, selector string) (Transport, error) {
 // machine would otherwise open a burst of independent SSH handshakes, and
 // OpenSSH scores aborted handshakes as auth failures under PerSourcePenalties,
 // which gets this host blocked for minutes.
-func (p *Pool) connect(ctx context.Context, machine Machine) (*Remote, error) {
+func (p *Pool) connect(ctx context.Context, machine Machine, verifySession bool) (*Remote, error) {
+	key := connectionKey(machine)
 	for {
 		p.mu.Lock()
-		if remote, ok := p.remotes[machine.ID]; ok {
+		if remote, ok := p.remotes[key]; ok {
 			remote.Touch()
 			p.mu.Unlock()
 			return remote, nil
 		}
-		if waiting, ok := p.dialing[machine.ID]; ok {
+		if waiting, ok := p.dialing[key]; ok {
 			p.mu.Unlock()
 			select {
 			case <-waiting:
@@ -148,18 +150,37 @@ func (p *Pool) connect(ctx context.Context, machine Machine) (*Remote, error) {
 			}
 		}
 		done := make(chan struct{})
-		p.dialing[machine.ID] = done
+		p.dialing[key] = done
+		protocol, generation := p.Protocol, p.generation
 		p.mu.Unlock()
 
-		remote, err := DialRemote(p.stop, machine, p.Protocol, p.RuntimeDir)
+		// Session discovery shares the dial gate: a burst naming a cold session
+		// must not run a burst of independent SSH probes before this gate.
+		var remote *Remote
+		var err error
+		if verifySession {
+			var sessions []Session
+			sessions, err = p.remoteSessions(ctx, machine)
+			if err == nil {
+				_, err = selectSession(sessions, machine.Session)
+			}
+		}
+		if err == nil {
+			remote, err = DialRemote(p.stop, machine, protocol, p.RuntimeDir)
+		}
 		p.mu.Lock()
-		delete(p.dialing, machine.ID)
+		delete(p.dialing, key)
 		close(done)
+		if err == nil && (generation != p.generation || p.stop.Err() != nil) {
+			p.mu.Unlock()
+			remote.Close()
+			return nil, fmt.Errorf("routing changed while connecting to %s; retry with the current tools", machine.Label)
+		}
 		if err == nil {
 			if p.Tune != nil {
 				p.Tune(remote.Queue)
 			}
-			p.remotes[machine.ID] = remote
+			p.remotes[key] = remote
 			p.startReaperLocked()
 		}
 		p.mu.Unlock()
@@ -174,28 +195,46 @@ func (p *Pool) connect(ctx context.Context, machine Machine) (*Remote, error) {
 // Disconnect drops one machine's connection. The next call to it reconnects.
 func (p *Pool) Disconnect(id string) bool {
 	p.mu.Lock()
-	remote, ok := p.remotes[id]
-	delete(p.remotes, id)
-	p.mu.Unlock()
-	if !ok {
-		return false
+	var remotes []*Remote
+	for key, remote := range p.remotes {
+		if remote.Machine.ID == id {
+			remotes = append(remotes, remote)
+			delete(p.remotes, key)
+		}
 	}
-	remote.Close()
-	return true
+	p.mu.Unlock()
+	for _, remote := range remotes {
+		remote.Close()
+	}
+	return len(remotes) > 0
 }
 
 // RemoteStatus is one connected machine, for /healthz and machine_list.
 type RemoteStatus struct {
-	ID           string        `json:"id"`
-	Label        string        `json:"label"`
-	Target       string        `json:"target"`
-	Session      string        `json:"session,omitempty"`
-	Enabled      bool          `json:"enabled"`
-	Connected    bool          `json:"connected"`
-	Version      string        `json:"herdr_version,omitempty"`
-	Protocol     int           `json:"protocol,omitempty"`
-	IdleForSecs  int           `json:"idle_for_seconds,omitempty"`
-	Availability *Availability `json:"herdr,omitempty"`
+	ID            string              `json:"id"`
+	Label         string              `json:"label"`
+	Target        string              `json:"target"`
+	Session       string              `json:"session,omitempty"`
+	Enabled       bool                `json:"enabled"`
+	Connected     bool                `json:"connected"`
+	Version       string              `json:"herdr_version,omitempty"`
+	Protocol      int                 `json:"protocol,omitempty"`
+	IdleForSecs   int                 `json:"idle_for_seconds,omitempty"`
+	Availability  *Availability       `json:"herdr,omitempty"`
+	Selector      string              `json:"selector"`
+	Sessions      []Session           `json:"sessions,omitempty"`
+	SessionsError string              `json:"sessions_error,omitempty"`
+	Connections   []SessionConnection `json:"connections,omitempty"`
+}
+
+// SessionConnection reports each forwarded session without confusing it with
+// the saved profile's configured session.
+type SessionConnection struct {
+	Session      string       `json:"session"`
+	Version      string       `json:"herdr_version,omitempty"`
+	Protocol     int          `json:"protocol"`
+	IdleForSecs  int          `json:"idle_for_seconds,omitempty"`
+	Availability Availability `json:"herdr"`
 }
 
 // Status describes every saved machine, marking the ones this bridge currently
@@ -206,45 +245,53 @@ func (p *Pool) Status(ctx context.Context) []RemoteStatus {
 	if err != nil {
 		machines = nil
 	}
-	p.mu.Lock()
-	connected := make(map[string]*Remote, len(p.remotes))
-	for id, remote := range p.remotes {
-		connected[id] = remote
-	}
-	p.mu.Unlock()
-
 	statuses := make([]RemoteStatus, 0, len(machines))
 	for _, machine := range machines {
-		status := RemoteStatus{
-			ID:      machine.ID,
-			Label:   machine.Label,
-			Target:  machine.Target,
-			Session: machine.SessionName(),
-			Enabled: machine.Enabled,
-		}
-		if remote, ok := connected[machine.ID]; ok {
-			availability := remote.Queue.Availability()
-			status.Connected = true
-			status.Version = remote.Version
-			status.Protocol = remote.Protocol
-			status.IdleForSecs = int(remote.IdleFor() / time.Second)
-			status.Availability = &availability
-		}
-		statuses = append(statuses, status)
+		statuses = append(statuses, p.statusFor(machine))
 	}
 	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Label < statuses[j].Label })
 	return statuses
+}
+
+func (p *Pool) statusFor(machine Machine) RemoteStatus {
+	status := RemoteStatus{ID: machine.ID, Label: machine.Label, Target: machine.Target,
+		Session: machine.SessionName(), Enabled: machine.Enabled, Selector: "ssh:" + escapeSelector(machine.ID)}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, remote := range p.remotes {
+		if remote.Machine.ID != machine.ID || remote.Machine.Target != machine.Target {
+			continue
+		}
+		availability := remote.Queue.Availability()
+		idle := int(remote.IdleFor() / time.Second)
+		status.Connected = true
+		status.Connections = append(status.Connections, SessionConnection{
+			Session: remote.Machine.SessionName(), Version: remote.Version, Protocol: remote.Protocol,
+			IdleForSecs: idle, Availability: availability,
+		})
+		if remote.Machine.SessionName() == machine.SessionName() {
+			status.Version, status.Protocol = remote.Version, remote.Protocol
+			status.IdleForSecs, status.Availability = idle, &availability
+		}
+	}
+	sort.Slice(status.Connections, func(i, j int) bool { return status.Connections[i].Session < status.Connections[j].Session })
+	return status
 }
 
 // Close drops every connection. The pool stays usable afterwards; a later call
 // reconnects. Shutdown just never makes one.
 func (p *Pool) Close() {
 	p.mu.Lock()
+	p.generation++
 	remotes := make([]*Remote, 0, len(p.remotes))
 	for _, remote := range p.remotes {
 		remotes = append(remotes, remote)
 	}
 	p.remotes = map[string]*Remote{}
+	for _, local := range p.locals {
+		local.cancel()
+	}
+	p.locals = map[string]*localConnection{}
 	p.mu.Unlock()
 	for _, remote := range remotes {
 		remote.Close()

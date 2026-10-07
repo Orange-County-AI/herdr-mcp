@@ -13,31 +13,58 @@ The tool surface follows the socket method names: `agent.read` becomes `agent_re
 
 It re-reads that schema on an interval and swaps the tools when it changed, and
 most tools take an optional `machine` argument that runs them on one of Herdr's
-saved SSH machines. See [Saved SSH machines](#saved-ssh-machines) and
+local sessions or saved SSH machines. See [Saved SSH machines](#saved-ssh-machines) and
 [Keeping up with Herdr](#keeping-up-with-herdr).
 
 ## Saved SSH machines
 
-Herdr 0.9 made remote machines first class: `herdr machine add` saves an SSH
-profile, and each one is an **independent Herdr server** with its own state.
-Most tools here take an optional `machine` argument naming one by label or
-profile id, so the same 93 methods drive any saved machine:
+Most tools take an optional `machine` argument selecting a Herdr session.
+Omitting it keeps using the bridge's startup socket, including an explicit
+`--socket` or `HERDR_SOCKET_PATH`. Local routing needs no SSH or saved profile.
 
 ```jsonc
-{"name": "pane_list",  "arguments": {}}                        // this machine
-{"name": "pane_list",  "arguments": {"machine": "minime"}}     // the saved "minime"
-{"name": "agent_prompt", "arguments": {"machine": "gigachad", "target": "reviewer",
-                                       "text": "Summarize the failing test."}}
+{"name": "machine_list", "arguments": {}}
+{"name": "agent_list", "arguments": {}}                              // startup socket
+{"name": "agent_list", "arguments": {"machine": "local:work"}}        // another local session
+{"name": "pane_list", "arguments": {"machine": "minime"}}             // profile's configured session
+{"name": "agent_list", "arguments": {"machine": "ssh:0fb972d6/work"}} // specific remote session
 ```
 
-Call `machine_list` to see the saved profiles and which ones the bridge is
-currently connected to. It is the one tool that is not a Herdr socket method:
-machine profiles are client-side configuration and the socket protocol has no
-`machine.*` method and no routing field in its request envelope.
+`machine_list` returns `local_sessions` and `machines`. Each session has its
+name, running state, socket path and a stable `selector`; saved machines retain
+their labels, IDs and configured session, and add a selector, connection state,
+`sessions`, or `sessions_error` if that host could not be listed. Local discovery
+uses `herdr session list --json`, so it follows Herdr's socket paths, including
+`~/.config/herdr/sessions/<name>/herdr.sock`. Saved profiles come from
+`herdr machine list --json`; remote sessions come from the same session-list
+command over SSH. Disabled profiles are listed without probing them. `connections` lists every
+forwarded session held for a profile; `connected` is true when any is held.
 
-**IDs are scoped to one machine.** Two machines can both have `w1:p1`, or an
-agent named `reviewer`. A pane id discovered locally never addresses a remote
-pane. List on the machine you intend to drive.
+Discovery is live on every roster request and selector resolution: sessions
+and machines added later need no bridge restart. Remote roster probes are
+read-only, run at most four at once, and share a five-second budget. A sleeping
+host gets its own discovery error while the rest of the roster remains usable;
+listing never starts a Herdr server or opens a forwarded socket. Health reporting
+keeps its existing no-SSH behavior and short discovery cache. During a Herdr
+binary upgrade, the roster
+can report cached local sessions or profiles with `local_sessions_error` or
+`machines_error` identifying the failed source. Dispatch always requires fresh
+discovery; cached reporting never authorizes a routed call.
+
+Copy selectors from the roster. `local:<name>` always selects a local session;
+`ssh:<profile-id>/<session>` always selects that remote session;
+`ssh:<profile-id>` uses the profile's configured session. Components are
+percent-encoded when necessary. Existing saved machine labels and IDs still
+work, and an unambiguous bare local session name also works. If a local session
+and a machine share a name, the bare selector fails and asks for an explicit
+selector. Labels and session names are case-sensitive. An empty selector is an
+error; omit the argument to use the startup socket.
+
+**IDs are scoped to one session.** Two sessions can both have `w1:p1`, or an
+agent named `reviewer`. List on the session you intend to drive and pass the
+same selector on subsequent tools. Every routed session uses the bridge's
+existing allow/deny method policy, short/long-poll admission queues and outage
+settings, through the same authenticated HTTP or stdio transport.
 
 **How it connects.** On first use the bridge asks that host for its Herdr socket
 path (`herdr status server --json` over SSH -- the path is not assumable, it is
@@ -45,13 +72,16 @@ path (`herdr status server --json` over SSH -- the path is not assumable, it is
 an agent box), then forwards that socket to a local one over an SSH control
 master and talks to it exactly as it talks to the local session. That is why
 every method works remotely and not just the subset Herdr's own
-`herdr --machine` CLI covers. Connections are made lazily, verified to speak the
+`herdr --machine` CLI covers. Remote connections are made lazily, verified to speak the
 same protocol the tools were registered from, and dropped after `--machine-idle`
 without use. The system `ssh` binary does the work, so `~/.ssh/config`
 (ProxyJump, IdentityFile, agent, Tailscale aliases) applies unchanged.
 
 **Requirements and limits.** Herdr 0.9+ on both ends, with the remote server
-already running -- forwarding never starts one. A failed remote call never falls
+already running -- forwarding never starts one. Stopped sessions, missing sockets,
+unknown or ambiguous selectors and protocol mismatches produce explicit errors.
+Routed sockets are checked against the registered protocol before delivering
+a method, including after a restart. A failed routed call never falls
 back to the local session, and a connection error does **not** prove a mutation
 was not applied: inspect remote state before retrying. Tools that act on the
 attached client (`client_window_title_*`, `client_shell_surface_set`,
@@ -72,7 +102,7 @@ So the bridge digests the schema document, re-reads it every
 `--schema-refresh` (default 5m), and when the digest moves it re-registers the
 tool surface in place and emits the MCP `tools/list_changed` notification.
 Removed methods are unregistered, added ones appear, the expected protocol is
-re-pointed, and every forwarded machine connection is dropped so the next call
+re-pointed, and every routed session connection is dropped so the next call
 re-verifies the far end against the new protocol. `/healthz` and `doctor` both
 report `schema_digest` so a stale bridge is visible rather than inferred.
 

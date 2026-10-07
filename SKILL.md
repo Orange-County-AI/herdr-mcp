@@ -218,37 +218,53 @@ answer "is Herdr actually reachable right now".
 
 ## Drive a saved SSH machine
 
-Herdr 0.9 made saved SSH machines first class, and most tools take an optional
-`machine` argument naming one by label or profile id. Omit it for the local
-session.
+Most tools take an optional `machine` argument selecting a local session or a
+saved SSH machine's session. Omit it to use the bridge's startup socket.
 
 ```jsonc
 {"name": "machine_list", "arguments": {}}
-{"name": "pane_list",    "arguments": {"machine": "minime"}}
-{"name": "agent_prompt", "arguments": {"machine": "gigachad", "target": "reviewer",
+{"name": "agent_list", "arguments": {"machine": "local:work"}}
+{"name": "pane_list", "arguments": {"machine": "minime"}}
+{"name": "agent_prompt", "arguments": {"machine": "ssh:0fb972d6/work", "target": "reviewer",
                                        "text": "Summarize the failing test."}}
 ```
 
-- **`machine_list` is the only discovery path.** Machine profiles are Herdr
-  client configuration; the socket protocol has no `machine.*` method. The
-  result also shows which machines the bridge currently holds a connection to.
-- **IDs are scoped to one machine.** Two machines can both have `w1:p1` or an
-  agent named `reviewer`. Never reuse a locally discovered id remotely: list on
-  the machine you intend to drive. Labels are case-sensitive.
-- **The far end must already be running Herdr 0.9+.** The bridge probes the
-  host for its socket path, forwards that socket over SSH, and refuses a machine
-  whose protocol differs from the one its tools were registered from. It never
-  starts a remote server.
-- **A failed remote call never falls back to local**, and a connection error
-  does not prove a mutation was not applied. Inspect remote state before
-  retrying anything that mutates.
+- **Discover first.** `machine_list` returns `local_sessions` and saved
+  `machines`, each with stable selectors. Machines include remote `sessions`
+  or a per-host `sessions_error`. Discovery is live: newly added sessions or
+  machines need no bridge restart. Remote listing is read-only, bounded to five
+  seconds with four concurrent probes, and never starts a server or a forward.
+  Disabled machines are listed without probing them. Each machine's
+  `connections` reports its forwarded sessions, including sessions other than
+  the profile's configured one. During a binary upgrade,
+  `local_sessions_error` or `machines_error` marks cached or unavailable
+  discovery; dispatch still requires fresh discovery.
+- **Copy the selector.** `local:<name>` selects a local session with no SSH.
+  `ssh:<profile-id>/<session>` selects a specific remote session;
+  `ssh:<profile-id>` uses the profile's configured session. Components are
+  percent-encoded when needed. Existing machine labels/IDs and unique bare
+  local session names work too. A collision between a session and a machine
+  requires an explicit selector. Names are case-sensitive; blank selectors fail.
+- **IDs are scoped to one session.** Discover workspace, pane and agent IDs on
+  the intended session and use the same selector for every follow-up call.
+- **The session must already be running.** Stopped sessions, missing sockets,
+  unknown selectors and protocol mismatches fail explicitly. The bridge checks
+  each routed socket's protocol before delivering a method, including after an
+  outage. It never starts Herdr or silently falls back to another socket.
+- **Policy is shared.** Routed sessions use the same allow/deny list, queue
+  limits, outage settings, auth and transports as the startup session. Local
+  sessions use their socket paths from `herdr session list --json`; saved
+  profiles come from `herdr machine list --json`.
+- **A connection error does not prove a mutation was not applied.** Inspect
+  state on the same session before retrying anything that mutates.
 - **Client-scoped tools are local-only** (`client_window_title_*`,
   `client_shell_surface_set`, `popup_close`, the dismiss tools,
-  `server_live_handoff`) and reject a `machine` argument, because there is no
-  attached client on the far end.
+  `server_live_handoff`) and reject a `machine` argument, because they act on
+  the client attached to the bridge's startup session.
 
-Connections are lazy, reuse one SSH control master per machine, and are dropped
-after `--machine-idle` (default `15m`). `--machines=false` disables routing.
+Remote connections are lazy, reuse one SSH control master per profile/session,
+and are dropped after `--machine-idle` (default `15m`). Local sessions share one
+queue per socket. `--machines=false` disables all routing.
 
 ## Expect the tool list to change under you
 
@@ -281,7 +297,7 @@ Before exposing a server to another user or agent, decide whether it needs the f
 - **Tool is absent:** inspect `HERDR_MCP_ALLOW_METHODS` and `HERDR_MCP_DENY_METHODS`, then restart the service.
 - **`events_subscribe` is absent:** this is intentional; use a one-shot wait tool.
 - **A `machine` argument is rejected as "not accepted":** either the tool is client-scoped and local-only, or the bridge runs with `--machines=false`. Check `machine_list`; if it is missing too, routing is off.
-- **`no saved Herdr machine matches ...`:** the error lists the known labels. They are case-sensitive, and a disabled profile is reported as disabled rather than missing. `herdr machine list --json` is the source of truth.
+- **`no saved Herdr machine matches ...`:** the error lists the known labels. They are case-sensitive, and a disabled profile is reported as disabled rather than missing. `herdr machine list --json` and `herdr session list --json` are the sources of truth. Use a selector from `machine_list` to avoid ambiguity.
 - **`Herdr is not running on <host>`:** start Herdr there; forwarding never starts a remote server. `ssh <host> herdr status server --json` reproduces the probe.
 - **A remote machine is refused on protocol:** the two Herdr installs are different releases. Update both, then let the bridge reload or restart it.
 - **A remote call fails to connect:** it was **not** rolled back for you. Inspect remote state with a list tool before retrying a mutation.

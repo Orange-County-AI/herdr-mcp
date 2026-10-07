@@ -290,7 +290,7 @@ func addCommonFlags(flags *flag.FlagSet) *commonFlags {
 	flags.IntVar(&common.longConcurrency, "max-long-concurrent", envInt("HERDR_MCP_MAX_LONG_CONCURRENT", 64), "simultaneous long-poll calls (agent_wait, events_wait, pane_wait_for_output, agent_prompt)")
 	flags.IntVar(&common.queueDepth, "queue-depth", envInt("HERDR_MCP_QUEUE_DEPTH", 256), "calls allowed to wait per lane before new ones are shed")
 	flags.DurationVar(&common.outageGrace, "outage-grace", envDuration("HERDR_MCP_OUTAGE_GRACE", 2*time.Minute), "how long a call waits for an unreachable Herdr before failing")
-	flags.BoolVar(&common.machines, "machines", envBool("HERDR_MCP_MACHINES", true), "accept a \"machine\" argument routing calls to saved Herdr SSH machines")
+	flags.BoolVar(&common.machines, "machines", envBool("HERDR_MCP_MACHINES", true), "accept a \"machine\" argument routing calls to local sessions and saved Herdr SSH machines")
 	flags.DurationVar(&common.machineIdle, "machine-idle", envDuration("HERDR_MCP_MACHINE_IDLE", 15*time.Minute), "disconnect a saved machine untouched for this long; negative keeps it until shutdown")
 	flags.DurationVar(&common.schemaRefresh, "schema-refresh", envDuration("HERDR_MCP_SCHEMA_REFRESH", 5*time.Minute), "how often to re-read Herdr's schema and reload the tools if it changed; zero disables")
 	return common
@@ -374,6 +374,7 @@ func buildRuntime(ctx context.Context, flags commonFlags, strict bool) (*runtime
 			bundle.Notes = append(bundle.Notes, fmt.Sprintf("machine routing disabled: %v", dirErr))
 		} else {
 			pool := herdr.NewPool(ctx, flags.herdrBinary, schema.Protocol, runtimeDir)
+			pool.StartupQueue = queue
 			pool.IdleTimeout = flags.machineIdle
 			pool.Tune = func(remote *herdr.Queue) {
 				remote.Concurrency = flags.concurrency
@@ -434,8 +435,7 @@ func watchSchema(ctx context.Context, bundle *runtimeBundle, flags commonFlags) 
 		if bundle.Machines != nil {
 			// Every forwarded machine was verified against the old protocol.
 			// Drop them so the next call re-probes and re-checks.
-			bundle.Machines.Protocol = schema.Protocol
-			bundle.Machines.Close()
+			bundle.Machines.SetProtocol(schema.Protocol)
 		}
 		log.Printf("schema: reloaded at protocol %d (%s): %d tools, added %s, removed %s",
 			schema.Protocol, schema.Digest[:19], bundle.Server.ToolCount(), describeList(added), describeList(removed))
