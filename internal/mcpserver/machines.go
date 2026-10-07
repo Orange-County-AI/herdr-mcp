@@ -10,20 +10,21 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// machineArgument is the parameter that routes a call to a saved SSH machine.
+// machineArgument is the parameter that routes a call to another Herdr session.
 // It is injected into the tool schemas rather than being a separate set of
 // tools: 93 methods times fifteen machines is not a tool surface any client can
 // use, and the method a caller wants is the same one either way.
 const machineArgument = "machine"
 
-const machineArgumentDescription = "Saved Herdr SSH machine to run this on: its label or profile id, from machine_list. " +
-	"Omit it for the local session. Workspace, tab, pane and agent IDs are scoped to one machine, " +
+const machineArgumentDescription = "Herdr session to run this on: local:<name>, ssh:<profile-id>/<session>, or an unambiguous session name or saved machine label/id from machine_list. " +
+	"Omit it for the bridge startup socket. Workspace, tab, pane and agent IDs are scoped to one session, " +
 	"so an id discovered locally never addresses a remote pane; list on the machine you intend to drive."
 
 // MachineRouter resolves a machine selector to the transport that reaches it.
 type MachineRouter interface {
 	Caller(ctx context.Context, selector string) (herdr.Transport, error)
 	Status(ctx context.Context) []herdr.RemoteStatus
+	Roster(ctx context.Context) (herdr.Roster, error)
 }
 
 // clientLocalMethods act on the Herdr client attached to this session, not on a
@@ -79,9 +80,12 @@ func splitMachine(params json.RawMessage) (string, json.RawMessage, error) {
 	delete(decoded, machineArgument)
 	selector, ok := raw.(string)
 	if !ok {
-		return "", nil, fmt.Errorf("%q must be a string naming a saved machine", machineArgument)
+		return "", nil, fmt.Errorf("%q must be a string naming a session or saved machine", machineArgument)
 	}
 	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return "", nil, fmt.Errorf("%q must not be empty; omit it to use the bridge startup socket", machineArgument)
+	}
 	rest, err := json.Marshal(decoded)
 	if err != nil {
 		return "", nil, fmt.Errorf("encode arguments without %q: %w", machineArgument, err)
@@ -99,7 +103,7 @@ func (s *Server) callerFor(ctx context.Context, method, selector string) (herdr.
 			strings.ReplaceAll(method, ".", "_"), selector)
 	}
 	if s.Machines == nil {
-		return nil, fmt.Errorf("this bridge was started without machine routing, so %q cannot be reached; restart herdr-mcp without --no-machines", selector)
+		return nil, fmt.Errorf("this bridge was started without machine routing, so %q cannot be reached; restart herdr-mcp with --machines=true", selector)
 	}
 	caller, err := s.Machines.Caller(ctx, selector)
 	if err != nil {
@@ -125,8 +129,8 @@ func (s *Server) registerMachineList() {
 	s.MCP.AddTool(&mcp.Tool{
 		Name:  machineListTool,
 		Title: "Machine List",
-		Description: "List the saved Herdr SSH machines this bridge can drive, and which ones it currently holds a connection to. " +
-			"Pass a label or id as the \"machine\" argument on any other tool to run it there. Inputs: none.",
+		Description: "List local Herdr sessions and saved SSH machines, including their sessions or a per-machine discovery error. Discovery is live and remote listing has a five-second budget. " +
+			"Pass a selector from the roster as the \"machine\" argument on another tool. Inputs: none.",
 		InputSchema: machineListSchema,
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:   readOnly,
@@ -142,10 +146,21 @@ func (s *Server) listMachines(ctx context.Context) *mcp.CallToolResult {
 	if s.Machines == nil {
 		return errorResult(machineListTool, fmt.Errorf("machine routing is disabled on this bridge"))
 	}
+	roster, err := s.Machines.Roster(ctx)
+	if err != nil {
+		return errorResult(machineListTool, err)
+	}
 	payload := map[string]any{
-		"machines": s.Machines.Status(ctx),
-		"note": "Pass a label or id as the \"machine\" argument on any tool. " +
-			"Workspace, tab, pane and agent IDs are scoped per machine; omit \"machine\" for the local session.",
+		"local_sessions": roster.LocalSessions,
+		"machines":       roster.Machines,
+		"note": "Pass a selector as the \"machine\" argument. Bare names must be unambiguous. " +
+			"IDs are scoped per session; omit \"machine\" for the bridge startup socket. Discovery never starts a server.",
+	}
+	if roster.LocalSessionsError != "" {
+		payload["local_sessions_error"] = roster.LocalSessionsError
+	}
+	if roster.MachinesError != "" {
+		payload["machines_error"] = roster.MachinesError
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

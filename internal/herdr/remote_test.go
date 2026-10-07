@@ -71,7 +71,7 @@ func TestDefaultRuntimeDirIsShortEnoughForAUnixSocket(t *testing.T) {
 }
 
 func TestPoolRejectsAnUnknownMachineWithoutDialling(t *testing.T) {
-	binary := fakeHerdr(t, `[{"id":"0fb972d6","label":"minime","target":"minime","session":"default","enabled":true}]`)
+	binary := routingHerdr(t, `[{"id":"0fb972d6","label":"minime","target":"minime","session":"default","enabled":true}]`, `{"sessions":[]}`)
 	pool := NewPool(context.Background(), binary, 22, t.TempDir())
 	_, err := pool.Caller(context.Background(), "nowhere")
 	if err == nil || !strings.Contains(err.Error(), "minime") {
@@ -118,7 +118,7 @@ func TestPoolKeepsTheLastMachineListWhenTheBinaryFails(t *testing.T) {
 	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	pool.listedAt = time.Time{} // force a refresh past the cache TTL
+	pool.listedAt = time.Time{} // force the health-reporting cache to refresh
 	machines, err := pool.Machines(context.Background())
 	if err != nil {
 		t.Fatalf("a failed refresh discarded the cached list: %v", err)

@@ -26,7 +26,7 @@ Prefer agent_prompt, agent_wait, and agent_read for agent conversations. pane_se
 Close, remove, unlink, uninstall, release, and server-stop methods are destructive. Only call them when the user explicitly intends that state change.
 events_subscribe and harness-internal lifecycle reporting are intentionally omitted from this client-facing tool surface.
 
-Saved SSH machines: most tools take an optional machine argument naming one of Herdr's saved machines by label or profile id. Call machine_list to see them; omit machine for the local session. Each machine is an independent Herdr server, so workspace, tab, pane and agent IDs are scoped to it: two machines can both have w1:p1 or an agent named reviewer. Discover IDs on the machine you intend to drive, never reuse a local one there. Connections are made over SSH on first use and a failed remote call never falls back to the local session, so a connection error does not prove a mutation was not applied -- inspect remote state before retrying. Tools that act on the attached client (window title, popup, announcements, live handoff) are local-only and take no machine argument.`
+Session routing: most tools take an optional machine argument. Call machine_list for a live roster of local sessions and saved SSH machines with their sessions or per-host discovery errors. Copy a selector: local:<name> reaches a local socket without SSH, ssh:<profile-id>/<session> reaches that remote session, and ssh:<profile-id> uses the saved profile's configured session. Components are percent-encoded when necessary. Existing machine labels/IDs and unambiguous bare local session names work; name collisions require explicit selectors. Omit machine for the bridge startup socket. IDs are scoped per session: discover them on the intended session and keep the same selector on follow-up calls. Stopped sessions, missing sockets and protocol mismatches fail explicitly; routing never starts a server or falls back to another socket. Connections to remote sessions use SSH on first use. A connection error does not prove a mutation was not applied; inspect state on the same session before retrying. Client-scoped tools (window title, popup, announcements, live handoff) act on the attached startup client and take no machine argument.`
 
 // defaultSlowCallThreshold is the point past which a *successful* call still
 // earns a log line. This server writes no response bytes until the tool
@@ -56,8 +56,8 @@ type Server struct {
 	Logf func(format string, args ...any)
 	// SlowCallThreshold overrides defaultSlowCallThreshold.
 	SlowCallThreshold time.Duration
-	// Machines routes a call carrying a "machine" argument to that saved SSH
-	// machine. Nil disables routing and leaves the tool schemas local-only.
+	// Machines routes a call carrying a "machine" argument to the selected Herdr
+	// session. Nil disables routing and leaves the tool schemas local-only.
 	Machines MachineRouter
 
 	// mu guards the fields Reload swaps while calls are in flight.
@@ -75,7 +75,7 @@ type Options struct {
 	Allow   []string
 	Deny    []string
 	// Machines, when set, adds a "machine" argument to every routable tool and
-	// dispatches those calls to the named saved SSH machine.
+	// dispatches those calls to the selected local or remote session.
 	Machines MachineRouter
 }
 

@@ -68,6 +68,7 @@ func SelectMachine(machines []Machine, selector string) (Machine, error) {
 		return Machine{}, fmt.Errorf("no machine selector given")
 	}
 	var disabled *Machine
+	var match *Machine
 	for index := range machines {
 		machine := machines[index]
 		if machine.ID != selector && machine.Label != selector {
@@ -77,7 +78,13 @@ func SelectMachine(machines []Machine, selector string) (Machine, error) {
 			disabled = &machines[index]
 			continue
 		}
-		return machine, nil
+		if match != nil {
+			return Machine{}, fmt.Errorf("machine selector %q is ambiguous; use a profile's ssh: selector from machine_list", selector)
+		}
+		match = &machines[index]
+	}
+	if match != nil {
+		return *match, nil
 	}
 	if disabled != nil {
 		return Machine{}, fmt.Errorf("machine %q is disabled; enable it with `herdr machine enable %s`", selector, disabled.Label)
