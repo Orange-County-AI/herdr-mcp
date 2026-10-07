@@ -23,7 +23,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 // schemaLoadBudget caps how long a degraded start waits on the Herdr binary
 // before falling back to the cached schema.
