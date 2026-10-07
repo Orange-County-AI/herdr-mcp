@@ -69,7 +69,7 @@ func TestAuthenticationMode(t *testing.T) {
 	}{
 		{Config{Listen: "127.0.0.1:8091", LookupEnv: noEnv}, "anonymous loopback"},
 		{bearerConfig("127.0.0.1:8091"), "bearer required"},
-		{Config{Listen: "127.0.0.1:8091", AccessTeam: "https://test.cloudflareaccess.com", AccessAudience: "test", LookupEnv: noEnv}, "Cloudflare Access JWT required"},
+		{Config{Listen: "127.0.0.1:8091", AccessTeam: "https://test.cloudflareaccess.com", AccessAudience: "test", AllowedHosts: []string{"mcp.tunnel.test"}, LookupEnv: noEnv}, "Cloudflare Access JWT required"},
 	} {
 		transport, err := New(tc.config)
 		if err != nil {
@@ -320,6 +320,8 @@ func TestSecretSourcesAndRotation(t *testing.T) {
 	for _, c := range []Config{
 		{Listen: "127.0.0.1:8091", AccessTeam: "https://team.cloudflareaccess.com", LookupEnv: noEnv},
 		{Listen: "127.0.0.1:8091", AccessAudience: "audience", LookupEnv: noEnv},
+		{Listen: "127.0.0.1:8091", AccessTeam: "https://team.cloudflareaccess.com", AccessAudience: "audience", LookupEnv: noEnv},
+		{Listen: "127.0.0.1:8091", AccessTeam: "https://team.cloudflareaccess.com", AccessAudience: "audience", AllowedHosts: []string{"localhost:8091"}, LookupEnv: noEnv},
 		{Listen: "127.0.0.1:8091", LookupEnv: func(key string) (string, bool) { return "", key == "HERDR_MCP_BEARER_TOKEN_FILE" }},
 	} {
 		if _, err := New(c); err == nil {

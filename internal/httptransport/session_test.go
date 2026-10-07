@@ -235,7 +235,7 @@ func TestCloudflareGuardCompatibility(t *testing.T) {
 }
 
 func TestAccessHealthWithRewrittenLoopbackHostIsMinimal(t *testing.T) {
-	transport, err := New(Config{Listen: "127.0.0.1:8091", AccessTeam: "https://test.cloudflareaccess.com", AccessAudience: "test", LookupEnv: noEnv})
+	transport, err := New(Config{Listen: "127.0.0.1:8091", AccessTeam: "https://test.cloudflareaccess.com", AccessAudience: "test", AllowedHosts: []string{"mcp.tunnel.test"}, LookupEnv: noEnv})
 	if err != nil {
 		t.Fatal(err)
 	}

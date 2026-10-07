@@ -323,6 +323,9 @@ CF_ACCESS_AUD=your-access-application-audience
 HERDR_MCP_ALLOWED_HOSTS=herdr-mcp.example.com
 ```
 
+`HERDR_MCP_ALLOWED_HOSTS` must name the tunnel hostname: cloudflared forwards
+it as the Host header, and the bridge refuses to start under Access without it.
+
 Bearer and Cloudflare settings are mutually exclusive: remove the bearer source
 when selecting Access, and remove both Access settings when selecting bearer.
 There is no OR fallback between them. After adding these settings, rerun

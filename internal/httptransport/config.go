@@ -145,6 +145,7 @@ func New(c Config) (*Transport, error) {
 			t.hosts[authority] = true
 		}
 	}
+	tunnelHost := false
 	for _, authority := range c.AllowedHosts {
 		normalized, err := normalizeAuthority(authority, t.requestScheme())
 		if err != nil {
@@ -154,6 +155,12 @@ func New(c Config) (*Transport, error) {
 			return nil, fmt.Errorf("non-loopback allowed Host requires authentication")
 		}
 		t.hosts[normalized] = true
+		tunnelHost = tunnelHost || !loopbackAuthority(normalized)
+	}
+	// cloudflared forwards the public hostname as Host, so without it every
+	// tunneled request fails the Host check with a 403 that looks like an outage.
+	if t.access != nil && !tunnelHost {
+		return nil, fmt.Errorf("Cloudflare Access requires the tunnel hostname in --allowed-hosts or HERDR_MCP_ALLOWED_HOSTS")
 	}
 	return t, nil
 }
