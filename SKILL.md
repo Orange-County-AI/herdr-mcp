@@ -1,6 +1,6 @@
 ---
 name: herdr-mcp
-description: "Install, configure, run, expose, and troubleshoot herdr-mcp, the MCP bridge for Herdr's socket API. Use when connecting Herdr to Claude, ChatGPT, or another MCP client; installing the loopback systemd service; configuring Cloudflare Tunnel, Access Managed OAuth, or Access JWT validation; restricting exposed Herdr methods; or diagnosing herdr-mcp health, schema, socket, and protocol errors."
+description: "Install, configure, run, expose, and troubleshoot herdr-mcp, the MCP bridge for Herdr's socket API. Use when connecting Herdr to Claude, ChatGPT, or another MCP client; installing the systemd service; configuring native private HTTPS and bearer auth, Cloudflare Tunnel, Access Managed OAuth, or Access JWT validation; restricting exposed Herdr methods; or diagnosing herdr-mcp health, schema, socket, and protocol errors."
 ---
 
 # Herdr MCP
@@ -51,13 +51,50 @@ For Claude Code:
 claude mcp add --transport stdio --scope user herdr -- herdr-mcp stdio
 ```
 
-Use Streamable HTTP only for a loopback origin that a private network or Cloudflare Tunnel reaches:
+Use loopback HTTP for local clients or a Cloudflare Access tunnel:
 
 ```bash
 herdr-mcp serve --listen 127.0.0.1:8091
 ```
 
-Never bind the origin to a public interface. The CLI refuses non-loopback listeners.
+Native private HTTPS is also supported. Provision an owner-only regular bearer
+secret file and a certificate chain/private key, then use:
+
+```bash
+herdr-mcp serve --listen 192.168.1.20:8091 --allow-private \
+  --bearer-token-file /home/you/.config/herdr-mcp/bearer-secret \
+  --tls-cert-file /home/you/.config/herdr-mcp/server-chain.pem \
+  --tls-key-file /home/you/.config/herdr-mcp/server-key.pem \
+  --allowed-hosts herdr.internal.example:8091
+```
+
+Private binding accepts only exact RFC1918/ULA IPs and requires bearer plus
+native TLS (minimum 1.2). Public/wildcard/CGNAT/DNS binds are refused. The secret
+must be 32–4096 ASCII token characters, with optional trailing `=` padding;
+file sources may end with a single LF/CRLF. Empty/invalid sources, symlinks,
+wrong ownership, and group/other file access fail startup. Alternatively inject
+`HERDR_MCP_BEARER_TOKEN` through the environment; never pass its value on argv,
+in a URL, in a unit, or in logs. Use a client secret store for its Authorization
+header on every request, including reconnect and DELETE. Missing/wrong/malformed
+credentials return 401; session IDs provide no authentication.
+
+Bearer and Cloudflare configurations are mutually exclusive, with no OR fallback.
+The Host must be the bind authority or an explicit allowed authority; Origin
+must match its scheme and Host. Forwarded headers are ignored for trust.
+Only exact GET /healthz is unauthenticated; bearer mode exposes only `{ok}`.
+There is no native OAuth discovery or HTTP version endpoint.
+
+Use certificates with matching DNS/IP SANs and install the private CA into all
+client trust stores, including the installer host's system roots. On
+Debian/Ubuntu use an owner-provisioned CA `.crt` in
+`/usr/local/share/ca-certificates/` and `update-ca-certificates`; macOS uses
+Keychain Access. Never disable verification. The service installer probes the
+bind IP over HTTPS, so include that IP SAN. Read the README's native HTTPS
+section for full provisioning and renewal instructions. Replace secret/cert/key
+files atomically and restart herdr-mcp to activate them; old MCP sessions end,
+and Herdr sessions remain intact. No automatic issuance or HTTP downgrade exists.
+Native HTTPS needs no proxy; Cloudflare to loopback is the supported external
+TLS termination path.
 
 ## Install the Linux user service
 
@@ -84,6 +121,18 @@ value before invoking the plugin action if the default port is occupied:
 HERDR_MCP_LISTEN=127.0.0.1:18091
 ```
 
+The installer also accepts `--allow-private`, `--bearer-token-file`,
+`--tls-cert-file`, `--tls-key-file`, and `--allowed-hosts`, or their
+`HERDR_MCP_*` environment-file equivalents from the README. It validates them
+before installation and never writes credential values. All validated nonsecret HTTP settings persist
+in the unit; reinstall to change auth mode, paths, TLS/Host settings or the bind
+address. Precedence is explicit flags > existing service env > defaults;
+transient shell HTTP defaults are ignored. Supported security entries are
+single-line assignments with optional whole quotes; export, escapes, multiline
+values and duplicates fail closed. Raw bearer env files must be owner-only.
+Generated authenticated units refuse to start when their credential source is
+missing; unvalidated systemd-manager settings are removed.
+
 The standalone command also accepts custom flags:
 
 ```bash
@@ -108,9 +157,12 @@ HERDR_MCP_ALLOW_METHODS=ping,session.snapshot,agent.*,pane.read,pane.wait_for_ou
 HERDR_MCP_DENY_METHODS=events.subscribe,pane.report_agent,pane.report_agent_session,pane.report_metadata,workspace.report_metadata,pane.clear_agent_authority,pane.release_agent,pane.graphics.*,server.ssh_agent.register
 CF_ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 CF_ACCESS_AUD=your-access-application-audience
+HERDR_MCP_ALLOWED_HOSTS=herdr-mcp.example.com
 ```
 
-After changing the file:
+After changing HTTP/auth/TLS settings, rerun `install-service` to validate and
+regenerate the unit. After changing common Herdr settings or rotating the
+credential/certificate at an existing source path:
 
 ```bash
 systemctl --user restart herdr-mcp.service
@@ -128,7 +180,7 @@ For remote Claude or ChatGPT access:
 3. Add an allow policy for the intended users.
 4. Enable Access Managed OAuth.
 5. Configure the redirect URI classes required by the clients.
-6. Put `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` in the service environment file so the origin validates `Cf-Access-Jwt-Assertion`.
+6. Put the tunnel hostname in `HERDR_MCP_ALLOWED_HOSTS`, and `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` in the service environment file so the origin validates `Cf-Access-Jwt-Assertion`.
 7. Give the client `https://<hostname>/mcp`.
 
 Cloudflare owns the authorization-code + PKCE flow. Do not put a second origin OAuth server behind Access Managed OAuth. Keep the tunnel origin loopback-only and do not open a firewall port.
@@ -153,7 +205,7 @@ stops. Do not read a failed `herdr-mcp` start as "Herdr is down" any more.
   starve ordinary calls. Past `--queue-depth` (256) waiting calls, new ones are
   shed with a saturation error rather than joining a queue that will only time
   out.
-- **`/healthz` `ok` means the bridge is serving, not that Herdr is up.** Read
+- **The detailed local `/healthz` report (unauthenticated default mode):** `ok` means the bridge is serving, not that Herdr is up. Read
   `herdr.available`, `herdr.down_for_seconds`, `herdr.waiting`, and
   `herdr.in_flight`. `ok:false` with HTTP 503 means the bridge itself cannot
   serve correctly -- currently only a Herdr protocol that no longer matches its

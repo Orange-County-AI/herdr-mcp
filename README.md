@@ -147,9 +147,114 @@ claude mcp add --transport stdio --scope user herdr -- herdr-mcp stdio
 ```
 
 
+## Native private HTTPS with bearer authentication
+
+The default remains `127.0.0.1:8091` over HTTP; stdio is unchanged. For a
+private network, the bridge can serve HTTPS directly through Go's standard TLS
+server. No proxy or automatic certificate issuance is involved.
+
+Provision a random bearer secret through your secret manager into a regular
+file owned by the service user, with mode `0600` (or `0400`). The file must
+contain 32–4096 ASCII characters from `A-Z a-z 0-9 - . _ ~ + /`, optionally
+followed by `=` padding and a single LF or CRLF. Symlinks, empty files,
+whitespace, and group/other permissions are rejected. Use at least 32 random
+bytes encoded as base64. Alternatively inject `HERDR_MCP_BEARER_TOKEN` into the
+server environment; an explicitly empty value fails startup. Choose one source.
+Never put the credential in command arguments, URLs, logs, unit files, or
+client configuration committed to source control. Configure the client's
+Authorization header through its secret store.
+
+With owner-provisioned files, start a private listener:
+
+```sh
+herdr-mcp serve --listen 192.168.1.20:8091 --allow-private \
+  --bearer-token-file /home/you/.config/herdr-mcp/bearer-secret \
+  --tls-cert-file /home/you/.config/herdr-mcp/server-chain.pem \
+  --tls-key-file /home/you/.config/herdr-mcp/server-key.pem \
+  --allowed-hosts herdr.internal.example:8091
+```
+
+Private binding is explicit and limited to RFC1918 IPv4 and IPv6 ULA addresses.
+Wildcards, public IPs, DNS bind names, and the CGNAT range `100.64.0.0/10` are
+refused. Private listeners require both native bearer auth and native TLS.
+Loopback HTTP remains available for local clients. Do not send bearer credentials
+across a public plaintext link. This feature does not open firewall ports,
+publish ports, provision certificates, or change production networking.
+
+Private-key files must be regular, service-user-owned, and inaccessible to
+group/others, like bearer files. Ports must be numeric in `1–65535`; zero is
+refused. Standard HTTP/HTTPS ports may be omitted from Host and Origin.
+
+The certificate chain must match the client's hostname or IP in its Subject
+Alternative Names. Use a certificate trusted by the client, or install the
+private CA's root certificate into the client machine's trust store and any
+application-specific trust store. On Debian/Ubuntu, place the **CA certificate**
+under `/usr/local/share/ca-certificates/` with a `.crt` extension and run
+`update-ca-certificates`; macOS clients can trust it through Keychain Access.
+Clients with a separate CA configuration must also trust that CA there. Keep the
+server private key readable only by the service user. Never disable certificate
+verification (`-k`, `InsecureSkipVerify`, or equivalent). TLS 1.2 is the minimum;
+incomplete, unreadable, malformed, or mismatched certificate/key configuration
+fails startup, with no HTTP fallback.
+
+Bearer authentication covers every HTTP method and route except exact
+`GET /healthz`: initialization, tool discovery/calls, SSE streaming,
+reconnection, session deletion, and unknown/discovery routes all require the
+header on every request. A session ID never authenticates a request. Missing,
+wrong, malformed, or duplicate credentials receive `401` with a Bearer
+challenge. Token digests are compared in constant time. There is no native
+OAuth discovery or version route; use the local `version` command.
+
+Host authorities are checked against the bind address and explicit
+`--allowed-hosts` entries, including their ports. Loopback aliases at the bind
+port are also accepted. Additional non-loopback hosts require authentication.
+An Origin, if present, must exactly match the request's scheme and Host;
+otherwise the request receives `403`. Forwarded headers do not grant trust or
+bypass authentication. No cross-origin browser access is enabled.
+
+Secrets and TLS files are read once at startup. Replace them atomically and
+restart **herdr-mcp** to rotate credentials or renew certificates; a restart
+ends old MCP sessions and streams, and clients must initialize again with the
+new credential. File replacement alone leaves the old credential and certificate
+active. This does not restart Herdr or alter its sessions.
+
+For the Linux service, place source paths and the private-bind opt-in in the
+existing `~/.config/herdr-mcp/env` (keep it owner-only):
+
+```dotenv
+HERDR_MCP_LISTEN=192.168.1.20:8091
+HERDR_MCP_ALLOW_PRIVATE=true
+HERDR_MCP_BEARER_TOKEN_FILE=/home/you/.config/herdr-mcp/bearer-secret
+HERDR_MCP_TLS_CERT_FILE=/home/you/.config/herdr-mcp/server-chain.pem
+HERDR_MCP_TLS_KEY_FILE=/home/you/.config/herdr-mcp/server-key.pem
+HERDR_MCP_ALLOWED_HOSTS=herdr.internal.example:8091
+```
+
+`install-service` accepts the same HTTP/TLS flags, validates configuration and certificate validity/SAN/trust
+before writing or restarting anything, and generates units containing only
+source paths and nonsecret settings. It preserves the existing environment file. Installer precedence is explicit flags (including false) > existing service
+environment > defaults. Transient shell HTTP defaults are ignored, and a raw
+bearer value supplied only to the installer process is rejected. All validated
+nonsecret HTTP settings are recorded in the unit; rerun `install-service` when
+changing auth mode, source paths, TLS/Host settings or the bind address.
+Generated authenticated units require auth at startup, so a missing credential
+source cannot silently start an anonymous service. Unvalidated manager
+environment settings are removed. The existing service environment supports
+simple single-line `NAME=value` assignments, optionally wholly single/double
+quoted; security settings with `export`, escapes, multiline values, duplicate
+keys or mixed quoting fail installation. A file containing the raw bearer
+credential must also be regular, service-user-owned and owner-only. Rotating
+the value at an existing credential source requires only a bridge restart. The HTTPS health check uses system
+trusted roots and the bind address, so the certificate must include that IP SAN (DNS SAN for
+`localhost`) and
+the installer host must trust its CA before installation. It never skips TLS
+verification. Native HTTPS does not require TLS termination. The supported
+external termination path is Cloudflare's authenticated tunnel to a loopback
+origin, described below; arbitrary forwarded headers are not trusted.
+
 ## Remote MCP through Cloudflare Tunnel
 
-The HTTP transport binds only to loopback. Point a Cloudflare Tunnel hostname at it, then protect that hostname with a Cloudflare Access **MCP server application** and enable **Managed OAuth**. Cloudflare owns the OAuth 2.0 authorization-code + PKCE flow; `herdr-mcp` remains the resource origin.
+For Cloudflare Access, keep the HTTP transport on loopback. Point a Cloudflare Tunnel hostname at it, then protect that hostname with a Cloudflare Access **MCP server application** and enable **Managed OAuth**. Cloudflare owns the OAuth 2.0 authorization-code + PKCE flow; `herdr-mcp` remains the resource origin.
 
 This split is deliberate. Claude and ChatGPT need interactive OAuth, and current MCP/OpenAI guidance recommends an established identity provider rather than a bespoke authorization server. Cloudflare Managed OAuth publishes the required discovery metadata, performs dynamic client registration, applies the Access policy, rotates tokens, and forwards the authenticated identity to the origin.
 
@@ -215,9 +320,25 @@ Cloudflare's MCP server application contract requires the origin to validate the
 ```dotenv
 CF_ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 CF_ACCESS_AUD=your-access-application-audience
+HERDR_MCP_ALLOWED_HOSTS=herdr-mcp.example.com
 ```
 
-When both values are present, `herdr-mcp` requires `Cf-Access-Jwt-Assertion` on `/mcp`, fetches Cloudflare's current RSA signing keys, and verifies the signature, issuer, audience, and expiry on every request. `/healthz` remains an unprivileged origin health check.
+`HERDR_MCP_ALLOWED_HOSTS` must name the tunnel hostname: cloudflared forwards
+it as the Host header, and the bridge refuses to start under Access without it.
+
+Bearer and Cloudflare settings are mutually exclusive: remove the bearer source
+when selecting Access, and remove both Access settings when selecting bearer.
+There is no OR fallback between them. After adding these settings, rerun
+`herdr-mcp install-service` (or its plugin action) to validate and record them
+before restarting the bridge.
+
+When both Access values are present, `herdr-mcp` requires `Cf-Access-Jwt-Assertion` on `/mcp`, fetches Cloudflare's current RSA signing keys, and verifies the signature, issuer, audience, and expiry on every request. `GET /healthz` is an unprivileged health probe: tunnel requests receive only
+`{"ok":true}` (or `false` with 503). Direct loopback probes retain existing
+diagnostics only in the unauthenticated default mode. Access always returns
+the minimal probe, including when the tunnel rewrites Host to loopback. Bearer mode always returns
+only the minimal probe, including on loopback. All other health methods require
+authentication first, then return 405. Access accepts an HTTPS Origin matching
+the explicitly allowed tunnel Host even though its local connection is HTTP.
 
 Do not put another origin OAuth server behind Access Managed OAuth. Managed OAuth replaces the protected application's `401` behavior by design.
 
@@ -316,7 +437,7 @@ An allow list is evaluated first; the deny list always wins.
 ## Commands
 
 ```text
-herdr-mcp serve [flags]            Streamable HTTP at /mcp plus GET /healthz
+herdr-mcp serve [flags]            Streamable HTTP/HTTPS at /mcp plus GET /healthz
 herdr-mcp stdio [flags]            MCP over stdin/stdout
 herdr-mcp doctor [flags]           schema/socket compatibility check
 herdr-mcp install-service [flags]  install and start a systemd user service
@@ -332,6 +453,13 @@ Common configuration:
 | `--allow-methods` | `HERDR_MCP_ALLOW_METHODS` | all methods |
 | `--deny-methods` | `HERDR_MCP_DENY_METHODS` | internal reporting, graphics, and `events.subscribe` |
 | `--listen` | `HERDR_MCP_LISTEN` | `127.0.0.1:8091` |
+| `--require-auth` | none (generated authenticated service invariant) | `false` |
+| `--allow-private` | `HERDR_MCP_ALLOW_PRIVATE` | `false` |
+| `--bearer-token-file` | `HERDR_MCP_BEARER_TOKEN_FILE` | unset |
+| environment only | `HERDR_MCP_BEARER_TOKEN` | unset |
+| `--tls-cert-file` | `HERDR_MCP_TLS_CERT_FILE` | unset |
+| `--tls-key-file` | `HERDR_MCP_TLS_KEY_FILE` | unset |
+| `--allowed-hosts` | `HERDR_MCP_ALLOWED_HOSTS` | bind authority and loopback aliases |
 | `--access-team-domain` | `CF_ACCESS_TEAM_DOMAIN` | unset |
 | `--access-aud` | `CF_ACCESS_AUD` | unset |
 | `--max-concurrent` | `HERDR_MCP_MAX_CONCURRENT` | `8` |
@@ -342,7 +470,8 @@ Common configuration:
 | `--machine-idle` | `HERDR_MCP_MACHINE_IDLE` | `15m` |
 | `--schema-refresh` | `HERDR_MCP_SCHEMA_REFRESH` | `5m` |
 
-`serve` refuses non-loopback listeners. Remote access belongs behind a tunnel and an authorization policy, not on a public origin port.
+`serve` refuses wildcard/public listeners and unauthenticated private listeners.
+Use native authenticated private HTTPS, or Cloudflare Access with a loopback origin.
 
 ## Development
 
@@ -351,7 +480,10 @@ mise run check
 mise run build
 ```
 
-The bridge has no generated copy of Herdr's API types. Tests cover schema extraction and reference closure, socket request/response behavior, MCP tool forwarding, systemd service installation, and Cloudflare Access JWT validation.
+The bridge has no generated copy of Herdr's API types. Tests cover schema extraction and reference closure, socket request/response behavior, MCP tool forwarding, stdio, systemd service installation, Cloudflare Access JWT
+validation, bearer/session authentication, Host/Origin checks, and native HTTPS
+with trusted and untrusted test CAs. Run `go test ./...`, `go test -race ./...`,
+`go vet ./...`, and `go build ./...` before handoff.
 
 ## License
 

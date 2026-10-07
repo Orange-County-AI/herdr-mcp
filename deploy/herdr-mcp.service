@@ -6,7 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/herdr-mcp/env
-ExecStart=%h/.local/bin/herdr-mcp serve --listen 127.0.0.1:8091
+# Loopback is the CLI default. The owner-only env file may explicitly opt in
+# to private bearer HTTPS using source paths; never put credentials here.
+ExecStart=%h/.local/bin/herdr-mcp serve
 Restart=always
 RestartSec=3
 # Load-bearing: ProtectHome=read-only makes the schema cache unwritable, and
