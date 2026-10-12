@@ -54,6 +54,23 @@ func TestSelectMachineRejectsDisabledAndUnknown(t *testing.T) {
 	}
 }
 
+func TestSelectMachineRejectsAmbiguousLabelsAndIDs(t *testing.T) {
+	for _, machines := range [][]Machine{
+		{{ID: "first", Label: "same", Enabled: true}, {ID: "second", Label: "same", Enabled: true}},
+		{{ID: "same", Label: "first", Enabled: true}, {ID: "second", Label: "same", Enabled: true}},
+	} {
+		if _, err := SelectMachine(machines, "same"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+			t.Fatalf("ambiguity err = %v", err)
+		}
+		for _, want := range machines {
+			got, err := selectMachineID(machines, want.ID)
+			if err != nil || got.ID != want.ID {
+				t.Fatalf("explicit id %q resolved to %+v, err = %v", want.ID, got, err)
+			}
+		}
+	}
+}
+
 func TestSessionNameTreatsDefaultAsUnset(t *testing.T) {
 	if got := (Machine{Session: "default"}).SessionName(); got != "" {
 		t.Fatalf("SessionName(default) = %q, want empty", got)

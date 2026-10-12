@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,7 +68,7 @@ const (
 // minimal PATH on most hosts, and herdr installs to ~/.local/bin, so without
 // this the probe reports "herdr not installed" on machines that have it.
 func remoteHerdrShell(command string) string {
-	return `${SHELL:-sh} -lc 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"; ` + command + `'`
+	return `${SHELL:-sh} -lc ` + shellQuote(`export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"; `+command)
 }
 
 // sshCommand builds an ssh invocation bounded by ctx. Two details make it safe
@@ -226,6 +227,7 @@ func DialRemote(parent context.Context, machine Machine, wantProtocol int, runti
 	remote.cancel = cancel
 	remote.done = make(chan struct{})
 	remote.Queue = NewQueue(ctx, remote.Client, wantProtocol)
+	remote.Queue.VerifyProtocol = true
 	go func() {
 		defer close(remote.done)
 		<-ctx.Done()
@@ -336,16 +338,10 @@ func (r *Remote) killMaster() {
 // socketTag names this machine's sockets. The label alone is not enough: two
 // labels that differ only in punctuation or case sanitize to the same string,
 // and two Remotes sharing a socket path would silently drive one host through
-// the other's tunnel. The profile ID prefix makes the name unique.
+// the other's tunnel. Hashing the profile, target and session separates them.
 func socketTag(machine Machine) string {
-	id := machine.ID
-	if len(id) > 8 {
-		id = id[:8]
-	}
-	if id == "" {
-		return sanitizeTag(machine.Label)
-	}
-	return sanitizeTag(machine.Label) + "-" + id
+	digest := sha256.Sum256([]byte(connectionKey(machine)))
+	return fmt.Sprintf("%s-%x", sanitizeTag(machine.Label), digest[:8])
 }
 
 // sanitizeTag keeps socket filenames short and predictable. Unix socket paths
