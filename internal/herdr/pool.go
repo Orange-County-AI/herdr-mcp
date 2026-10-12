@@ -56,6 +56,12 @@ const (
 	defaultIdleTimeout = 15 * time.Minute
 	machineListTTL     = 30 * time.Second
 	reapInterval       = time.Minute
+	// maxSessionProbes bounds concurrent remote session listings. Each probe
+	// targets a different host, so the bound is about local process count, not
+	// any one host's load. It must exceed a typical fleet: roster probes share
+	// one five-second budget, and a host waiting for a slot behind sleeping
+	// ones would be reported unreachable when it is not.
+	maxSessionProbes = 16
 )
 
 // NewPool builds a pool bound to stop, which tears every connection down when
@@ -66,7 +72,7 @@ func NewPool(stop context.Context, binary string, protocol int, runtimeDir strin
 		Protocol:      protocol,
 		RuntimeDir:    runtimeDir,
 		stop:          stop,
-		sessionProbes: make(chan struct{}, 4),
+		sessionProbes: make(chan struct{}, maxSessionProbes),
 		remotes:       map[string]*Remote{},
 		locals:        map[string]*localConnection{},
 		dialing:       map[string]chan struct{}{},
@@ -160,7 +166,7 @@ func (p *Pool) connect(ctx context.Context, machine Machine, verifySession bool)
 		var err error
 		if verifySession {
 			var sessions []Session
-			sessions, err = p.remoteSessions(ctx, machine)
+			sessions, err = p.remoteSessions(ctx, machine, verifyListBudget)
 			if err == nil {
 				_, err = selectSession(sessions, machine.Session)
 			}

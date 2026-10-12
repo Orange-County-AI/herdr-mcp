@@ -42,7 +42,7 @@ forwarded session held for a profile; `connected` is true when any is held.
 
 Discovery is live on every roster request and selector resolution: sessions
 and machines added later need no bridge restart. Remote roster probes are
-read-only, run at most four at once, and share a five-second budget. A sleeping
+read-only, run at most sixteen at once, and share a five-second budget. A sleeping
 host gets its own discovery error while the rest of the roster remains usable;
 listing never starts a Herdr server or opens a forwarded socket. Health reporting
 keeps its existing no-SSH behavior and short discovery cache. During a Herdr

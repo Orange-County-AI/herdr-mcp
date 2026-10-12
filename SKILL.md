@@ -233,7 +233,7 @@ saved SSH machine's session. Omit it to use the bridge's startup socket.
   `machines`, each with stable selectors. Machines include remote `sessions`
   or a per-host `sessions_error`. Discovery is live: newly added sessions or
   machines need no bridge restart. Remote listing is read-only, bounded to five
-  seconds with four concurrent probes, and never starts a server or a forward.
+  seconds with sixteen concurrent probes, and never starts a server or a forward.
   Disabled machines are listed without probing them. Each machine's
   `connections` reports its forwarded sessions, including sessions other than
   the profile's configured one. During a binary upgrade,

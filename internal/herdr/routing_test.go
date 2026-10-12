@@ -259,7 +259,8 @@ esac
 
 func TestRosterKeepsLocalSessionsWhenRemoteDiscoveryFails(t *testing.T) {
 	sshDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(sshDir, "ssh"), []byte("#!/bin/sh\nexit 255\n"), 0o700); err != nil {
+	script := "#!/bin/sh\necho 'ssh: connect to host sleeping port 22: Operation timed out' >&2\nexit 255\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "ssh"), []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -268,6 +269,35 @@ func TestRosterKeepsLocalSessionsWhenRemoteDiscoveryFails(t *testing.T) {
 	roster, err := pool.Roster(context.Background())
 	if err != nil || len(roster.LocalSessions) != 1 || len(roster.Machines) != 1 || roster.Machines[0].SessionsError == "" {
 		t.Fatalf("roster = %+v, err = %v", roster, err)
+	}
+	if !strings.Contains(roster.Machines[0].SessionsError, "Operation timed out") {
+		t.Fatalf("discovery error hid ssh's reason: %q", roster.Machines[0].SessionsError)
+	}
+}
+
+// A fleet larger than the probe bound would queue live hosts behind sleeping
+// ones until the shared roster budget ran out, reporting them unreachable.
+func TestRosterListsAFleetWithinOneBudget(t *testing.T) {
+	sshDir := t.TempDir()
+	script := "#!/bin/sh\nsleep 2\necho '{\"sessions\":[]}'\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "ssh"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var machines []string
+	for index := 0; index < 12; index++ {
+		machines = append(machines, fmt.Sprintf(`{"id":"id%d","label":"host%02d","target":"host%d","enabled":true}`, index, index, index))
+	}
+	binary := routingHerdr(t, "["+strings.Join(machines, ",")+"]", `{"sessions":[]}`)
+	pool := NewPool(context.Background(), binary, 22, t.TempDir())
+	roster, err := pool.Roster(context.Background())
+	if err != nil || len(roster.Machines) != 12 {
+		t.Fatalf("roster = %+v, err = %v", roster, err)
+	}
+	for _, machine := range roster.Machines {
+		if machine.SessionsError != "" {
+			t.Fatalf("%s starved behind other probes: %s", machine.Label, machine.SessionsError)
+		}
 	}
 }
 

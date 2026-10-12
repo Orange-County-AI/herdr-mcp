@@ -3,6 +3,7 @@ package herdr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os/exec"
@@ -22,6 +23,22 @@ type Session struct {
 }
 
 const discoveryTimeout = 5 * time.Second
+
+// Remote session listing has two budgets. A roster probe is tight so one
+// sleeping host cannot hold machine_list up. Verifying a named session before
+// a dial gets the dial probe's budget instead: naming a session must not make
+// a sleeping host harder to reach than naming its profile, and an SSH
+// handshake killed mid-flight counts against this host under OpenSSH's
+// PerSourcePenalties.
+type remoteListBudget struct {
+	timeout        time.Duration
+	connectTimeout string
+}
+
+var (
+	rosterListBudget = remoteListBudget{timeout: discoveryTimeout, connectTimeout: "3"}
+	verifyListBudget = remoteListBudget{timeout: sshProbeTimeout, connectTimeout: "10"}
+)
 
 func localSelector(name string) string { return "local:" + url.PathEscape(name) }
 
@@ -99,15 +116,27 @@ func ListSessions(ctx context.Context, binary string) ([]Session, error) {
 
 // listRemoteSessions only runs a read-only CLI command. It never starts Herdr
 // or opens a forwarded socket, and a sleeping machine has a bounded cost.
-func listRemoteSessions(ctx context.Context, machine Machine) ([]Session, error) {
-	ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
+func listRemoteSessions(ctx context.Context, machine Machine, budget remoteListBudget) ([]Session, error) {
+	ctx, cancel := context.WithTimeout(ctx, budget.timeout)
 	defer cancel()
 	output, err := sshCommand(ctx,
 		"-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
-		"-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=accept-new",
+		"-o", "ConnectTimeout="+budget.connectTimeout, "-o", "StrictHostKeyChecking=accept-new",
 		machine.Target, remoteHerdrShell("herdr session list --json")).Output()
 	if err != nil {
-		return nil, fmt.Errorf("list sessions on %s: %w", machine.Target, err)
+		// As in probeMachine: a context kill surfaces as an ExitError, so check
+		// the budget first, and report ssh's own reason rather than "exit status 255".
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("timed out listing sessions on %s", machine.Target)
+		}
+		detail := err.Error()
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if stderr := firstLine(strings.TrimSpace(string(exitErr.Stderr))); stderr != "" {
+				detail = stderr
+			}
+		}
+		return nil, fmt.Errorf("list sessions on %s: %s", machine.Target, detail)
 	}
 	sessions, err := decodeSessions(output)
 	for index := range sessions {

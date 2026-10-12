@@ -159,8 +159,8 @@ type Roster struct {
 	MachinesError      string         `json:"machines_error,omitempty"`
 }
 
-func (p *Pool) remoteSessions(ctx context.Context, machine Machine) ([]Session, error) {
-	ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
+func (p *Pool) remoteSessions(ctx context.Context, machine Machine, budget remoteListBudget) ([]Session, error) {
+	ctx, cancel := context.WithTimeout(ctx, budget.timeout)
 	defer cancel()
 	select {
 	case p.sessionProbes <- struct{}{}:
@@ -168,7 +168,7 @@ func (p *Pool) remoteSessions(ctx context.Context, machine Machine) ([]Session, 
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return listRemoteSessions(ctx, machine)
+	return listRemoteSessions(ctx, machine, budget)
 }
 
 // Roster discovers local sessions and saved profiles on every request. Remote
@@ -212,7 +212,7 @@ func (p *Pool) Roster(ctx context.Context) (Roster, error) {
 		wait.Add(1)
 		go func(index int, machine Machine) {
 			defer wait.Done()
-			found, err := p.remoteSessions(listCtx, machine)
+			found, err := p.remoteSessions(listCtx, machine, rosterListBudget)
 			if err != nil {
 				statuses[index].SessionsError = err.Error()
 				return
