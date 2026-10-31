@@ -43,6 +43,10 @@ type Remote struct {
 	done     chan struct{}
 	teardown sync.Once
 	closed   sync.Once
+
+	callMu      sync.Mutex
+	activeCalls int
+	retired     bool
 }
 
 // SSH budgets. connectTimeout bounds the control-master handshake, which on a
@@ -173,6 +177,12 @@ func DialRemote(parent context.Context, machine Machine, wantProtocol int, runti
 			machine.Label, status.Version, status.Protocol, wantProtocol)
 	}
 
+	// Temporary runtime directories can disappear while the bridge stays alive.
+	// Validate before removing old sockets or asking ssh to bind new ones.
+	if err := ensureRuntimeDir(runtimeDir); err != nil {
+		return nil, err
+	}
+
 	tag := socketTag(machine)
 	remote := &Remote{
 		Machine:   machine,
@@ -274,9 +284,34 @@ func (r *Remote) waitForSocket(ctx context.Context, wantProtocol int) error {
 
 // Call sends one method to this machine through its own admission-control queue.
 func (r *Remote) Call(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	r.callMu.Lock()
+	if r.retired {
+		r.callMu.Unlock()
+		return nil, fmt.Errorf("remote forward was retired before dispatch; resolve the machine again")
+	}
+	r.activeCalls++
+	r.callMu.Unlock()
+	defer func() {
+		r.callMu.Lock()
+		r.activeCalls--
+		r.callMu.Unlock()
+	}()
 	r.Touch()
 	defer r.Touch()
 	return r.Queue.Call(ctx, method, params)
+}
+
+// retireIfIdle fences old callers before replacing an unlinked forward.
+// A caller that already obtained this Remote either finishes before retirement
+// or fails before dispatch. In-flight mutations are never interrupted/replayed.
+func (r *Remote) retireIfIdle() bool {
+	r.callMu.Lock()
+	defer r.callMu.Unlock()
+	if r.activeCalls != 0 {
+		return false
+	}
+	r.retired = true
+	return true
 }
 
 // Touch records that this connection is in use, deferring the idle reaper.

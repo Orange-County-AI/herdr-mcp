@@ -88,8 +88,8 @@ func DefaultRuntimeDir() (string, error) {
 		base = os.TempDir()
 	}
 	dir := filepath.Join(base, "herdr-mcp")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create runtime directory %s: %w", dir, err)
+	if err := ensureRuntimeDir(dir); err != nil {
+		return "", err
 	}
 	return dir, nil
 }
@@ -138,13 +138,31 @@ func (p *Pool) Caller(ctx context.Context, selector string) (Transport, error) {
 // OpenSSH scores aborted handshakes as auth failures under PerSourcePenalties,
 // which gets this host blocked for minutes.
 func (p *Pool) connect(ctx context.Context, machine Machine, verifySession bool) (*Remote, error) {
+	if err := ensureRuntimeDir(p.RuntimeDir); err != nil {
+		return nil, err
+	}
 	key := connectionKey(machine)
 	for {
 		p.mu.Lock()
+		var stale *Remote
 		if remote, ok := p.remotes[key]; ok {
-			remote.Touch()
-			p.mu.Unlock()
-			return remote, nil
+			if _, err := os.Stat(remote.localSock); err == nil {
+				remote.Touch()
+				p.mu.Unlock()
+				return remote, nil
+			} else if !os.IsNotExist(err) {
+				p.mu.Unlock()
+				return nil, fmt.Errorf("inspect forwarded socket: %w", err)
+			}
+			// The forward was unlinked (for example by runtime-directory
+			// cleanup). Replace it under the same dial gate before dispatch;
+			// never replay a request that may already have reached the agent.
+			if !remote.retireIfIdle() {
+				p.mu.Unlock()
+				return nil, fmt.Errorf("forwarded socket is missing but calls are still active; retry after they finish")
+			}
+			delete(p.remotes, key)
+			stale = remote
 		}
 		if waiting, ok := p.dialing[key]; ok {
 			p.mu.Unlock()
@@ -159,6 +177,9 @@ func (p *Pool) connect(ctx context.Context, machine Machine, verifySession bool)
 		p.dialing[key] = done
 		protocol, generation := p.Protocol, p.generation
 		p.mu.Unlock()
+		if stale != nil {
+			stale.Close()
+		}
 
 		// Session discovery shares the dial gate: a burst naming a cold session
 		// must not run a burst of independent SSH probes before this gate.
