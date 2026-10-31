@@ -206,7 +206,7 @@ esac
 	}
 	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	binary := routingHerdr(t, `[{"id":"id","label":"host","target":"host","session":"work","enabled":true}]`, `{"sessions":[]}`)
-	pool := NewPool(ctx, binary, 22, t.TempDir())
+	pool := NewPool(ctx, binary, 22, filepath.Join(t.TempDir(), "runtime"))
 	defer pool.Close()
 	roster, err := pool.Roster(ctx)
 	if err != nil || len(roster.Machines) != 1 || len(roster.Machines[0].Sessions) != 2 || roster.Machines[0].SessionsError != "" {
@@ -238,6 +238,21 @@ esac
 		result, err := caller.Call(ctx, "agent.list", nil)
 		if err != nil || string(result) != fmt.Sprintf(`{"session":%q}`, name) {
 			t.Fatalf("%s: result = %s, err = %v", selector, result, err)
+		}
+	}
+	// A removed runtime directory must invalidate cached forwards and recover
+	// before dispatching another call, without restarting the bridge.
+	if err := os.RemoveAll(pool.RuntimeDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"work", "other"} {
+		caller, err := pool.Caller(ctx, "ssh:id/"+name)
+		if err != nil {
+			t.Fatalf("recover %s after runtime cleanup: %v", name, err)
+		}
+		result, err := caller.Call(ctx, "agent.list", nil)
+		if err != nil || string(result) != fmt.Sprintf(`{"session":%q}`, name) {
+			t.Fatalf("recovered %s: result=%s err=%v", name, result, err)
 		}
 	}
 	if len(pool.remotes) != 2 {
