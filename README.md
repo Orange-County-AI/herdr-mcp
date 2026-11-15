@@ -518,3 +518,62 @@ with trusted and untrusted test CAs. Run `go test ./...`, `go test -race ./...`,
 ## License
 
 Apache-2.0.
+
+### Experimental status Events (stdio only)
+
+`herdr-mcp stdio --experimental-events` enables protocol-level `events/list`
+and `events/poll` for `pane.agent_status_changed`. It is disabled by default.
+This is an experiment against [SEP 3415 at revision
+4165cc2e580afa795842002f631edbbe17c63757](https://github.com/pja-ant/modelcontextprotocol/blob/4165cc2e580afa795842002f631edbbe17c63757/seps/3415-events-extension.md),
+not a new wait tool. The SEP text says Accepted while its upstream PR remains
+open. A client must implement that Events contract and MCP `2026-07-28`;
+ordinary MCP tool support, including in ChatGPT, does not imply event support.
+HTTP `serve` does not accept the flag. An event-enabled server cannot be served
+through `HTTPHandler`. Push, webhooks and persistence are not implemented.
+
+Discovery advertises `capabilities.extensions["io.modelcontextprotocol/events"]`
+and a poll-only event descriptor with `inputSchema` and `payloadSchema`. The
+extension observes only events allowed by the existing `events.wait` method
+policy. Excluding `events.wait` hides the descriptor and rejects polls, even
+with the flag enabled. The internal `events.subscribe` connection is still not
+exposed as an MCP tool. Schema reload closes cached event streams.
+
+For example, send `events/poll` with these parameters:
+
+```json
+{"name":"pane.agent_status_changed","arguments":{"pane_id":"p1","machine":"local:work"},"cursor":null}
+```
+
+`pane_id` is required. Omit `machine` for the startup socket, or use the existing
+selectors from `machine_list`. A pane ID belongs to that session; keep both
+arguments unchanged on subsequent polls. A missing or null cursor starts now,
+returning an empty `events` array and a fresh opaque cursor. Send that cursor
+back to receive later events. Results carry `resultType: "complete"`, `events`,
+`cursor`, `truncated`, `hasMore`, and `nextPollMs` (currently 1000). Follow
+`hasMore` immediately to drain pages. `maxEvents` accepts 1–256 (default 100),
+and optional nonnegative `maxAgeMs` bounds replay age.
+
+Each occurrence contains `eventId`, `name`, `timestamp`, and `data` with only
+`pane_id` and `agent_status`. Timestamps are bridge receipt time because Herdr
+supplies no source timestamp or stable event ID. Buffered occurrences retain
+the same ID across repeated polls. Herdr also emits these events for presentation
+changes, so successive events can report the same status. Titles, agent names, terminal output and
+other metadata are discarded. Treat status payloads as untrusted data; receipt
+of an event does not authorize a tool action.
+
+The bridge keeps at most 32 pane subscriptions, each retaining 256 occurrences.
+One fixed-pane producer connection is shared for each resolved client and pane;
+watching another pane does not rebuild existing filters. Stop polling to release
+a watch after 60 seconds of inactivity (cleanup runs every 30 seconds). At
+capacity new watches return `ResourceExhausted`, rather than evicting active
+watches. Shutdown closes all producer connections. Polling a saved remote route
+uses the same discovery and protocol checks as tools and keeps its SSH route
+active while it is used.
+
+Buffer overflow, an age cutoff, source disconnect/loss, idle expiry, schema
+reload, or bridge restart can skip events. A recovered poll reports
+`truncated: true` with a fresh cursor; save it and fetch authoritative state with
+tools if completeness matters. A failed source reconnect returns an error and
+does not advance the cursor. Events during disconnected intervals cannot be
+recovered. There is no background reconnect loop and no guarantee of delivery
+across restarts. Keep polling more frequently than the 60-second idle lease.
