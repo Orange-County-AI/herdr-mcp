@@ -13,31 +13,58 @@ The tool surface follows the socket method names: `agent.read` becomes `agent_re
 
 It re-reads that schema on an interval and swaps the tools when it changed, and
 most tools take an optional `machine` argument that runs them on one of Herdr's
-saved SSH machines. See [Saved SSH machines](#saved-ssh-machines) and
+local sessions or saved SSH machines. See [Saved SSH machines](#saved-ssh-machines) and
 [Keeping up with Herdr](#keeping-up-with-herdr).
 
 ## Saved SSH machines
 
-Herdr 0.9 made remote machines first class: `herdr machine add` saves an SSH
-profile, and each one is an **independent Herdr server** with its own state.
-Most tools here take an optional `machine` argument naming one by label or
-profile id, so the same 93 methods drive any saved machine:
+Most tools take an optional `machine` argument selecting a Herdr session.
+Omitting it keeps using the bridge's startup socket, including an explicit
+`--socket` or `HERDR_SOCKET_PATH`. Local routing needs no SSH or saved profile.
 
 ```jsonc
-{"name": "pane_list",  "arguments": {}}                        // this machine
-{"name": "pane_list",  "arguments": {"machine": "minime"}}     // the saved "minime"
-{"name": "agent_prompt", "arguments": {"machine": "gigachad", "target": "reviewer",
-                                       "text": "Summarize the failing test."}}
+{"name": "machine_list", "arguments": {}}
+{"name": "agent_list", "arguments": {}}                              // startup socket
+{"name": "agent_list", "arguments": {"machine": "local:work"}}        // another local session
+{"name": "pane_list", "arguments": {"machine": "minime"}}             // profile's configured session
+{"name": "agent_list", "arguments": {"machine": "ssh:0fb972d6/work"}} // specific remote session
 ```
 
-Call `machine_list` to see the saved profiles and which ones the bridge is
-currently connected to. It is the one tool that is not a Herdr socket method:
-machine profiles are client-side configuration and the socket protocol has no
-`machine.*` method and no routing field in its request envelope.
+`machine_list` returns `local_sessions` and `machines`. Each session has its
+name, running state, socket path and a stable `selector`; saved machines retain
+their labels, IDs and configured session, and add a selector, connection state,
+`sessions`, or `sessions_error` if that host could not be listed. Local discovery
+uses `herdr session list --json`, so it follows Herdr's socket paths, including
+`~/.config/herdr/sessions/<name>/herdr.sock`. Saved profiles come from
+`herdr machine list --json`; remote sessions come from the same session-list
+command over SSH. Disabled profiles are listed without probing them. `connections` lists every
+forwarded session held for a profile; `connected` is true when any is held.
 
-**IDs are scoped to one machine.** Two machines can both have `w1:p1`, or an
-agent named `reviewer`. A pane id discovered locally never addresses a remote
-pane. List on the machine you intend to drive.
+Discovery is live on every roster request and selector resolution: sessions
+and machines added later need no bridge restart. Remote roster probes are
+read-only, run at most sixteen at once, and share a five-second budget. A sleeping
+host gets its own discovery error while the rest of the roster remains usable;
+listing never starts a Herdr server or opens a forwarded socket. Health reporting
+keeps its existing no-SSH behavior and short discovery cache. During a Herdr
+binary upgrade, the roster
+can report cached local sessions or profiles with `local_sessions_error` or
+`machines_error` identifying the failed source. Dispatch always requires fresh
+discovery; cached reporting never authorizes a routed call.
+
+Copy selectors from the roster. `local:<name>` always selects a local session;
+`ssh:<profile-id>/<session>` always selects that remote session;
+`ssh:<profile-id>` uses the profile's configured session. Components are
+percent-encoded when necessary. Existing saved machine labels and IDs still
+work, and an unambiguous bare local session name also works. If a local session
+and a machine share a name, the bare selector fails and asks for an explicit
+selector. Labels and session names are case-sensitive. An empty selector is an
+error; omit the argument to use the startup socket.
+
+**IDs are scoped to one session.** Two sessions can both have `w1:p1`, or an
+agent named `reviewer`. List on the session you intend to drive and pass the
+same selector on subsequent tools. Every routed session uses the bridge's
+existing allow/deny method policy, short/long-poll admission queues and outage
+settings, through the same authenticated HTTP or stdio transport.
 
 **How it connects.** On first use the bridge asks that host for its Herdr socket
 path (`herdr status server --json` over SSH -- the path is not assumable, it is
@@ -45,13 +72,16 @@ path (`herdr status server --json` over SSH -- the path is not assumable, it is
 an agent box), then forwards that socket to a local one over an SSH control
 master and talks to it exactly as it talks to the local session. That is why
 every method works remotely and not just the subset Herdr's own
-`herdr --machine` CLI covers. Connections are made lazily, verified to speak the
+`herdr --machine` CLI covers. Remote connections are made lazily, verified to speak the
 same protocol the tools were registered from, and dropped after `--machine-idle`
 without use. The system `ssh` binary does the work, so `~/.ssh/config`
 (ProxyJump, IdentityFile, agent, Tailscale aliases) applies unchanged.
 
 **Requirements and limits.** Herdr 0.9+ on both ends, with the remote server
-already running -- forwarding never starts one. A failed remote call never falls
+already running -- forwarding never starts one. Stopped sessions, missing sockets,
+unknown or ambiguous selectors and protocol mismatches produce explicit errors.
+Routed sockets are checked against the registered protocol before delivering
+a method, including after a restart. A failed routed call never falls
 back to the local session, and a connection error does **not** prove a mutation
 was not applied: inspect remote state before retrying. Tools that act on the
 attached client (`client_window_title_*`, `client_shell_surface_set`,
@@ -72,7 +102,7 @@ So the bridge digests the schema document, re-reads it every
 `--schema-refresh` (default 5m), and when the digest moves it re-registers the
 tool surface in place and emits the MCP `tools/list_changed` notification.
 Removed methods are unregistered, added ones appear, the expected protocol is
-re-pointed, and every forwarded machine connection is dropped so the next call
+re-pointed, and every routed session connection is dropped so the next call
 re-verifies the far end against the new protocol. `/healthz` and `doctor` both
 report `schema_digest` so a stale bridge is visible rather than inferred.
 
@@ -147,9 +177,114 @@ claude mcp add --transport stdio --scope user herdr -- herdr-mcp stdio
 ```
 
 
+## Native private HTTPS with bearer authentication
+
+The default remains `127.0.0.1:8091` over HTTP; stdio is unchanged. For a
+private network, the bridge can serve HTTPS directly through Go's standard TLS
+server. No proxy or automatic certificate issuance is involved.
+
+Provision a random bearer secret through your secret manager into a regular
+file owned by the service user, with mode `0600` (or `0400`). The file must
+contain 32–4096 ASCII characters from `A-Z a-z 0-9 - . _ ~ + /`, optionally
+followed by `=` padding and a single LF or CRLF. Symlinks, empty files,
+whitespace, and group/other permissions are rejected. Use at least 32 random
+bytes encoded as base64. Alternatively inject `HERDR_MCP_BEARER_TOKEN` into the
+server environment; an explicitly empty value fails startup. Choose one source.
+Never put the credential in command arguments, URLs, logs, unit files, or
+client configuration committed to source control. Configure the client's
+Authorization header through its secret store.
+
+With owner-provisioned files, start a private listener:
+
+```sh
+herdr-mcp serve --listen 192.168.1.20:8091 --allow-private \
+  --bearer-token-file /home/you/.config/herdr-mcp/bearer-secret \
+  --tls-cert-file /home/you/.config/herdr-mcp/server-chain.pem \
+  --tls-key-file /home/you/.config/herdr-mcp/server-key.pem \
+  --allowed-hosts herdr.internal.example:8091
+```
+
+Private binding is explicit and limited to RFC1918 IPv4 and IPv6 ULA addresses.
+Wildcards, public IPs, DNS bind names, and the CGNAT range `100.64.0.0/10` are
+refused. Private listeners require both native bearer auth and native TLS.
+Loopback HTTP remains available for local clients. Do not send bearer credentials
+across a public plaintext link. This feature does not open firewall ports,
+publish ports, provision certificates, or change production networking.
+
+Private-key files must be regular, service-user-owned, and inaccessible to
+group/others, like bearer files. Ports must be numeric in `1–65535`; zero is
+refused. Standard HTTP/HTTPS ports may be omitted from Host and Origin.
+
+The certificate chain must match the client's hostname or IP in its Subject
+Alternative Names. Use a certificate trusted by the client, or install the
+private CA's root certificate into the client machine's trust store and any
+application-specific trust store. On Debian/Ubuntu, place the **CA certificate**
+under `/usr/local/share/ca-certificates/` with a `.crt` extension and run
+`update-ca-certificates`; macOS clients can trust it through Keychain Access.
+Clients with a separate CA configuration must also trust that CA there. Keep the
+server private key readable only by the service user. Never disable certificate
+verification (`-k`, `InsecureSkipVerify`, or equivalent). TLS 1.2 is the minimum;
+incomplete, unreadable, malformed, or mismatched certificate/key configuration
+fails startup, with no HTTP fallback.
+
+Bearer authentication covers every HTTP method and route except exact
+`GET /healthz`: initialization, tool discovery/calls, SSE streaming,
+reconnection, session deletion, and unknown/discovery routes all require the
+header on every request. A session ID never authenticates a request. Missing,
+wrong, malformed, or duplicate credentials receive `401` with a Bearer
+challenge. Token digests are compared in constant time. There is no native
+OAuth discovery or version route; use the local `version` command.
+
+Host authorities are checked against the bind address and explicit
+`--allowed-hosts` entries, including their ports. Loopback aliases at the bind
+port are also accepted. Additional non-loopback hosts require authentication.
+An Origin, if present, must exactly match the request's scheme and Host;
+otherwise the request receives `403`. Forwarded headers do not grant trust or
+bypass authentication. No cross-origin browser access is enabled.
+
+Secrets and TLS files are read once at startup. Replace them atomically and
+restart **herdr-mcp** to rotate credentials or renew certificates; a restart
+ends old MCP sessions and streams, and clients must initialize again with the
+new credential. File replacement alone leaves the old credential and certificate
+active. This does not restart Herdr or alter its sessions.
+
+For the Linux service, place source paths and the private-bind opt-in in the
+existing `~/.config/herdr-mcp/env` (keep it owner-only):
+
+```dotenv
+HERDR_MCP_LISTEN=192.168.1.20:8091
+HERDR_MCP_ALLOW_PRIVATE=true
+HERDR_MCP_BEARER_TOKEN_FILE=/home/you/.config/herdr-mcp/bearer-secret
+HERDR_MCP_TLS_CERT_FILE=/home/you/.config/herdr-mcp/server-chain.pem
+HERDR_MCP_TLS_KEY_FILE=/home/you/.config/herdr-mcp/server-key.pem
+HERDR_MCP_ALLOWED_HOSTS=herdr.internal.example:8091
+```
+
+`install-service` accepts the same HTTP/TLS flags, validates configuration and certificate validity/SAN/trust
+before writing or restarting anything, and generates units containing only
+source paths and nonsecret settings. It preserves the existing environment file. Installer precedence is explicit flags (including false) > existing service
+environment > defaults. Transient shell HTTP defaults are ignored, and a raw
+bearer value supplied only to the installer process is rejected. All validated
+nonsecret HTTP settings are recorded in the unit; rerun `install-service` when
+changing auth mode, source paths, TLS/Host settings or the bind address.
+Generated authenticated units require auth at startup, so a missing credential
+source cannot silently start an anonymous service. Unvalidated manager
+environment settings are removed. The existing service environment supports
+simple single-line `NAME=value` assignments, optionally wholly single/double
+quoted; security settings with `export`, escapes, multiline values, duplicate
+keys or mixed quoting fail installation. A file containing the raw bearer
+credential must also be regular, service-user-owned and owner-only. Rotating
+the value at an existing credential source requires only a bridge restart. The HTTPS health check uses system
+trusted roots and the bind address, so the certificate must include that IP SAN (DNS SAN for
+`localhost`) and
+the installer host must trust its CA before installation. It never skips TLS
+verification. Native HTTPS does not require TLS termination. The supported
+external termination path is Cloudflare's authenticated tunnel to a loopback
+origin, described below; arbitrary forwarded headers are not trusted.
+
 ## Remote MCP through Cloudflare Tunnel
 
-The HTTP transport binds only to loopback. Point a Cloudflare Tunnel hostname at it, then protect that hostname with a Cloudflare Access **MCP server application** and enable **Managed OAuth**. Cloudflare owns the OAuth 2.0 authorization-code + PKCE flow; `herdr-mcp` remains the resource origin.
+For Cloudflare Access, keep the HTTP transport on loopback. Point a Cloudflare Tunnel hostname at it, then protect that hostname with a Cloudflare Access **MCP server application** and enable **Managed OAuth**. Cloudflare owns the OAuth 2.0 authorization-code + PKCE flow; `herdr-mcp` remains the resource origin.
 
 This split is deliberate. Claude and ChatGPT need interactive OAuth, and current MCP/OpenAI guidance recommends an established identity provider rather than a bespoke authorization server. Cloudflare Managed OAuth publishes the required discovery metadata, performs dynamic client registration, applies the Access policy, rotates tokens, and forwards the authenticated identity to the origin.
 
@@ -215,9 +350,25 @@ Cloudflare's MCP server application contract requires the origin to validate the
 ```dotenv
 CF_ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 CF_ACCESS_AUD=your-access-application-audience
+HERDR_MCP_ALLOWED_HOSTS=herdr-mcp.example.com
 ```
 
-When both values are present, `herdr-mcp` requires `Cf-Access-Jwt-Assertion` on `/mcp`, fetches Cloudflare's current RSA signing keys, and verifies the signature, issuer, audience, and expiry on every request. `/healthz` remains an unprivileged origin health check.
+`HERDR_MCP_ALLOWED_HOSTS` must name the tunnel hostname: cloudflared forwards
+it as the Host header, and the bridge refuses to start under Access without it.
+
+Bearer and Cloudflare settings are mutually exclusive: remove the bearer source
+when selecting Access, and remove both Access settings when selecting bearer.
+There is no OR fallback between them. After adding these settings, rerun
+`herdr-mcp install-service` (or its plugin action) to validate and record them
+before restarting the bridge.
+
+When both Access values are present, `herdr-mcp` requires `Cf-Access-Jwt-Assertion` on `/mcp`, fetches Cloudflare's current RSA signing keys, and verifies the signature, issuer, audience, and expiry on every request. `GET /healthz` is an unprivileged health probe: tunnel requests receive only
+`{"ok":true}` (or `false` with 503). Direct loopback probes retain existing
+diagnostics only in the unauthenticated default mode. Access always returns
+the minimal probe, including when the tunnel rewrites Host to loopback. Bearer mode always returns
+only the minimal probe, including on loopback. All other health methods require
+authentication first, then return 405. Access accepts an HTTPS Origin matching
+the explicitly allowed tunnel Host even though its local connection is HTTP.
 
 Do not put another origin OAuth server behind Access Managed OAuth. Managed OAuth replaces the protected application's `401` behavior by design.
 
@@ -316,7 +467,7 @@ An allow list is evaluated first; the deny list always wins.
 ## Commands
 
 ```text
-herdr-mcp serve [flags]            Streamable HTTP at /mcp plus GET /healthz
+herdr-mcp serve [flags]            Streamable HTTP/HTTPS at /mcp plus GET /healthz
 herdr-mcp stdio [flags]            MCP over stdin/stdout
 herdr-mcp doctor [flags]           schema/socket compatibility check
 herdr-mcp install-service [flags]  install and start a systemd user service
@@ -332,6 +483,13 @@ Common configuration:
 | `--allow-methods` | `HERDR_MCP_ALLOW_METHODS` | all methods |
 | `--deny-methods` | `HERDR_MCP_DENY_METHODS` | internal reporting, graphics, and `events.subscribe` |
 | `--listen` | `HERDR_MCP_LISTEN` | `127.0.0.1:8091` |
+| `--require-auth` | none (generated authenticated service invariant) | `false` |
+| `--allow-private` | `HERDR_MCP_ALLOW_PRIVATE` | `false` |
+| `--bearer-token-file` | `HERDR_MCP_BEARER_TOKEN_FILE` | unset |
+| environment only | `HERDR_MCP_BEARER_TOKEN` | unset |
+| `--tls-cert-file` | `HERDR_MCP_TLS_CERT_FILE` | unset |
+| `--tls-key-file` | `HERDR_MCP_TLS_KEY_FILE` | unset |
+| `--allowed-hosts` | `HERDR_MCP_ALLOWED_HOSTS` | bind authority and loopback aliases |
 | `--access-team-domain` | `CF_ACCESS_TEAM_DOMAIN` | unset |
 | `--access-aud` | `CF_ACCESS_AUD` | unset |
 | `--max-concurrent` | `HERDR_MCP_MAX_CONCURRENT` | `8` |
@@ -342,7 +500,8 @@ Common configuration:
 | `--machine-idle` | `HERDR_MCP_MACHINE_IDLE` | `15m` |
 | `--schema-refresh` | `HERDR_MCP_SCHEMA_REFRESH` | `5m` |
 
-`serve` refuses non-loopback listeners. Remote access belongs behind a tunnel and an authorization policy, not on a public origin port.
+`serve` refuses wildcard/public listeners and unauthenticated private listeners.
+Use native authenticated private HTTPS, or Cloudflare Access with a loopback origin.
 
 ## Development
 
@@ -351,8 +510,70 @@ mise run check
 mise run build
 ```
 
-The bridge has no generated copy of Herdr's API types. Tests cover schema extraction and reference closure, socket request/response behavior, MCP tool forwarding, systemd service installation, and Cloudflare Access JWT validation.
+The bridge has no generated copy of Herdr's API types. Tests cover schema extraction and reference closure, socket request/response behavior, MCP tool forwarding, stdio, systemd service installation, Cloudflare Access JWT
+validation, bearer/session authentication, Host/Origin checks, and native HTTPS
+with trusted and untrusted test CAs. Run `go test ./...`, `go test -race ./...`,
+`go vet ./...`, and `go build ./...` before handoff.
 
 ## License
 
 Apache-2.0.
+
+### Experimental status Events (stdio only)
+
+`herdr-mcp stdio --experimental-events` enables protocol-level `events/list`
+and `events/poll` for `pane.agent_status_changed`. It is disabled by default.
+This is an experiment against [SEP 3415 at revision
+4165cc2e580afa795842002f631edbbe17c63757](https://github.com/pja-ant/modelcontextprotocol/blob/4165cc2e580afa795842002f631edbbe17c63757/seps/3415-events-extension.md),
+not a new wait tool. The SEP text says Accepted while its upstream PR remains
+open. A client must implement that Events contract and MCP `2026-07-28`;
+ordinary MCP tool support, including in ChatGPT, does not imply event support.
+HTTP `serve` does not accept the flag. An event-enabled server cannot be served
+through `HTTPHandler`. Push, webhooks and persistence are not implemented.
+
+Discovery advertises `capabilities.extensions["io.modelcontextprotocol/events"]`
+and a poll-only event descriptor with `inputSchema` and `payloadSchema`. The
+extension observes only events allowed by the existing `events.wait` method
+policy. Excluding `events.wait` hides the descriptor and rejects polls, even
+with the flag enabled. The internal `events.subscribe` connection is still not
+exposed as an MCP tool. Schema reload closes cached event streams.
+
+For example, send `events/poll` with these parameters:
+
+```json
+{"name":"pane.agent_status_changed","arguments":{"pane_id":"p1","machine":"local:work"},"cursor":null}
+```
+
+`pane_id` is required. Omit `machine` for the startup socket, or use the existing
+selectors from `machine_list`. A pane ID belongs to that session; keep both
+arguments unchanged on subsequent polls. A missing or null cursor starts now,
+returning an empty `events` array and a fresh opaque cursor. Send that cursor
+back to receive later events. Results carry `resultType: "complete"`, `events`,
+`cursor`, `truncated`, `hasMore`, and `nextPollMs` (currently 1000). Follow
+`hasMore` immediately to drain pages. `maxEvents` accepts 1–256 (default 100),
+and optional nonnegative `maxAgeMs` bounds replay age.
+
+Each occurrence contains `eventId`, `name`, `timestamp`, and `data` with only
+`pane_id` and `agent_status`. Timestamps are bridge receipt time because Herdr
+supplies no source timestamp or stable event ID. Buffered occurrences retain
+the same ID across repeated polls. Herdr also emits these events for presentation
+changes, so successive events can report the same status. Titles, agent names, terminal output and
+other metadata are discarded. Treat status payloads as untrusted data; receipt
+of an event does not authorize a tool action.
+
+The bridge keeps at most 32 pane subscriptions, each retaining 256 occurrences.
+One fixed-pane producer connection is shared for each resolved client and pane;
+watching another pane does not rebuild existing filters. Stop polling to release
+a watch after 60 seconds of inactivity (cleanup runs every 30 seconds). At
+capacity new watches return `ResourceExhausted`, rather than evicting active
+watches. Shutdown closes all producer connections. Polling a saved remote route
+uses the same discovery and protocol checks as tools and keeps its SSH route
+active while it is used.
+
+Buffer overflow, an age cutoff, source disconnect/loss, idle expiry, schema
+reload, or bridge restart can skip events. A recovered poll reports
+`truncated: true` with a fresh cursor; save it and fetch authoritative state with
+tools if completeness matters. A failed source reconnect returns an error and
+does not advance the cursor. Events during disconnected intervals cannot be
+recovered. There is no background reconnect loop and no guarantee of delivery
+across restarts. Keep polling more frequently than the 60-second idle lease.
