@@ -197,6 +197,8 @@ func (s *Server) ToolCount() int {
 // HTTPHandler returns the Streamable HTTP transport suitable for /mcp.
 func (s *Server) HTTPHandler() http.Handler {
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s.MCP }, &mcp.StreamableHTTPOptions{
+		// MCP 2026-07-28 tool discovery requires a stateless HTTP transport.
+		Stateless: true,
 		// The outer httptransport guard authenticates every request and checks
 		// Host/Origin, including an explicitly allowed Cloudflare hostname.
 		DisableLocalhostProtection: true,

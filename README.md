@@ -177,6 +177,18 @@ claude mcp add --transport stdio --scope user herdr -- herdr-mcp stdio
 ```
 
 
+## Streamable HTTP protocol support
+
+The HTTP transport is stateless, as required by MCP 2026-07-28. Clients can use
+`server/discover`, `tools/list`, and `tools/call` without a session handshake.
+Legacy clients can still use `initialize` and make tool requests.
+
+HTTP does not create `Mcp-Session-Id` headers; legacy GET event streams and
+DELETE session requests return `405`. Use stdio when a client needs a persistent
+connection for unsolicited notifications. HTTP clients should refresh tool
+discovery when the Herdr schema changes. Authentication is still checked on
+every HTTP request; stateless transport does not mean unauthenticated access.
+
 ## Native private HTTPS with bearer authentication
 
 The default remains `127.0.0.1:8091` over HTTP; stdio is unchanged. For a
